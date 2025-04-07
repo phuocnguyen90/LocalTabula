@@ -40,13 +40,14 @@ This Streamlit web app lets you upload tabular data (Excel files or published Go
    cd <your-repository-name>
 
 2. **Create and Activate a Virtual Environment:**
-
-python -m venv venv
-source venv/bin/activate  # Linux/macOS
-# venv\Scripts\activate     # Windows
+    ```bash
+    python -m venv venv
+    source venv/bin/activate  # Linux/macOS
+    venv\Scripts\activate     # Windows
 
 3. **Install Dependencies:**
 
+    ```python
     pip install -r requirements.txt
 
     For GPU acceleration, install llama-cpp-python with appropriate compilation flags (see llama-cpp-python docs).
@@ -67,7 +68,9 @@ Copy and edit .env.example to create your .env file. Key variables include:
 
 # Start the App:
 
+    ```bash
     streamlit run app.py
+    ```
 
     Open your browser at the URL provided by Streamlit (typically http://localhost:8501).
 
