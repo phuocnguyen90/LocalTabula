@@ -1,0 +1,16 @@
+streamlit
+pandas
+python-dotenv
+qdrant-client>=1.7.0 # Use a recent version
+fastembed>=0.2.0     # Use a recent version
+llama-cpp-python     # Install/compile separately for GPU (see below)
+openai>=1.0.0        # For OpenRouter access
+huggingface_hub>=0.17.0 # For model downloads
+openpyxl             # For reading Excel files
+torch                # Required by transformers/fastembed
+sentencepiece        # Often required by tokenizers
+# Add specific versions if needed
+# google-generativeai # Only if you revert to Gemini API
+# bitsandbytes        # Only if using transformers quantization
+# accelerate          # Only if using transformers quantization/device_map
+# transformers        # Only if using transformers quantization
