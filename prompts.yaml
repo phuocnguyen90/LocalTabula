@@ -1,0 +1,176 @@
+# prompts.yaml
+
+suggest_semantic_columns: |
+  Analyze the following table schema and sample data to identify columns containing free-form text suitable for semantic search (embedding). Semantic search is used for finding similar descriptions, understanding meaning, or searching based on concepts rather than exact values.
+
+  Table Name: {table_name}
+
+  Schema (Columns and Types - Inferred):
+  {schema_str}
+
+  Sample Data (First 5 Rows):
+  {df_head_str}
+
+  Identify the column names from the schema list that contain natural language text, descriptions, notes, or comments that would be valuable for semantic search. Exclude IDs, numerical values, dates, codes, categories (unless the categories themselves have descriptive names), or URLs unless the URL text itself is descriptive.
+
+  Respond ONLY with a valid JSON list of strings containing the suggested column names. Example: ["product_description", "customer_review_text"]
+  If no columns seem suitable, respond with an empty JSON list: []
+
+  Suggested Columns JSON:
+
+# Used by _route_query (structured output) and route_query_wrapper
+route_query_structured: |
+  Analyze the context and user query to determine the best approach.
+
+  Database Schema:
+  {schema}
+  {sample_data_context}
+  User Query:
+  "{user_query}"
+
+  Carefully consider the query's intent:
+  - Choose "SQL" if the query requires precise data retrieval, filtering, aggregation (counts, sums, averages), or specific values matching the schema columns.
+  - Choose "SEMANTIC" if the query asks for descriptions, meaning, similarity, or information likely found in unstructured text columns (like product descriptions, notes, etc.).
+
+  Respond ONLY with a valid JSON object containing a single key "query_type" whose value is either the string "SQL" or the string "SEMANTIC". Example: {{"query_type": "SQL"}}
+
+# Base prompt for SQL generation
+generate_sql_base: |
+  Given the database schema:
+  {schema}
+
+  {sample_context}
+  Generate an SQLite query to find the data relevant to the user's question. Follow these rules:
+  1. Select `*` or key columns plus relevant value columns.
+  2. Use correct numerical comparisons (e.g., `Count < 5`, not `Count < 5 units`).
+  3. Handle extremes (min/max/top) by retrieving all ties (e.g., using subqueries like `WHERE col = (SELECT MAX(col) ...)` or `ORDER BY ... LIMIT 5` as fallback).
+  4. Avoid unnecessary `ORDER BY` or `LIMIT` otherwise.
+
+  User question: "{user_query}"
+
+# Addendum for SQL generation retries based on feedback
+generate_sql_feedback_syntax: |
+
+  PREVIOUS ATTEMPT FAILED due to a syntax error.
+  Incorrect SQL: `{previous_sql}`
+  Error: "{feedback}"
+  Please correct the syntax.
+
+generate_sql_feedback_other: |
+
+  PREVIOUS ATTEMPT was unsatisfactory.
+  SQL Executed: `{previous_sql}`
+  Reason: "{feedback}"
+  Please generate an improved query incorporating this feedback.
+
+# Final instruction for SQL generation response format
+generate_sql_response_format: |
+
+  Respond ONLY with the SQLite query, ending with a semicolon.
+  SQLite Query:
+
+# Prompt for validating SQL results
+validate_sql_results: |
+  You are validating SQL query results.
+  User's original query: "{user_query}"
+  Executed SQL query: `{executed_sql}`
+  Data returned (sample):
+  {context_str}
+
+  Does the returned data accurately and completely answer the user's original query? Consider if the filtering, ordering, and selected columns are appropriate.
+
+  Respond ONLY with a valid JSON object with two keys:
+  1. "satisfactory": boolean (true if the data answers the query, false otherwise).
+  2. "reason": string (if false, a BRIEF explanation of why, e.g., "missing filter for category", "wrong ordering", "needs different columns". If true, this can be an empty string or null).
+  Example if unsatisfactory: {{"satisfactory": false, "reason": "The query returned the highest price, but the user asked for the cheapest."}}
+  Example if satisfactory: {{"satisfactory": true, "reason": ""}}
+
+# Prompt to check if query is English
+check_language: |
+  Is the following query primarily written in English? Respond only with YES or NO.
+
+  Query: "{user_query}"
+
+# Prompt to translate a query to English
+translate_to_english: |
+  Translate the following query accurately into English. Respond ONLY with the English translation.
+
+  Query: "{user_query}"
+
+  English Translation:
+
+# Prompt for summarizing requirements from conversation history
+derive_requirements_from_history: |
+  You are an expert data assistant. Based on the following conversation history between a user and an assistant, derive a concise summary of the user's real requirements for searching the database. Focus on any specific filters, desired aggregations, or conditions mentioned by the user.
+
+  Conversation History:
+  {context}
+
+  Please provide a refined summary of the user's requirements that can be used to generate the best search query.
+  Refined Requirements:
+
+# Consolidated prompt for refining query, selecting table, and determining route
+refine_and_select: |
+  You are an expert data analyst assisting a user querying a database with potentially multiple tables. Your primary goal is to determine the correct table and the best way to query it based on the user's request and available data structure.
+
+  **Inputs:**
+  1.  **Conversation History (Last few turns):**
+      {recent_context}
+  2.  **User's Latest Query:** "{user_query}"
+  3.  **Database Schema (Available tables and their columns):**
+      {schema} # Example: {{'sales': ['sale_id', 'product', 'amount', 'date'], 'products': ['product_id', 'name', 'description', 'category']}}
+
+  **Analysis Steps & Output Instructions:**
+  Perform the following steps and structure your response as a single JSON object:
+
+  1.  **Identify the Most Relevant Table:**
+      - Carefully analyze the **User's Latest Query** and the **Conversation History**.
+      - Examine the **Database Schema**, paying close attention to the **column names** within each table.
+      - Determine which **single table** from the schema keys is most likely to contain the information needed to answer the query. Consider keywords in the query and how they match table names or, more importantly, column names.
+      - **Output Key:** `"selected_table"`: string (The name of the *single most relevant table*. Choose only one from the schema keys provided.)
+
+  2.  **Refine the User Query for the Selected Table:**
+      - Based on the table chosen in Step 1, rewrite the **User's Latest Query** into a more detailed and precise question.
+      - Incorporate context from the **Conversation History** if it clarifies the intent.
+      - The refined query should be specific to the columns and context of the `selected_table`.
+      - **Output Key:** `"refined_query"`: string (The detailed query, tailored for the selected table.)
+
+  3.  **Determine the Query Route for the Refined Query:**
+      - Considering the nature of the **Refined Query** and the likely data types in the **Selected Table's** columns (e.g., text descriptions vs. numerical values, IDs, dates):
+      - Decide if the query is best answered by generating an exact SQL query ('SQL') to retrieve specific data points, aggregates, or filtered rows.
+      - Or, decide if it's better answered using semantic search ('SEMANTIC') to find information based on meaning, similarity, or within free-text columns (like descriptions, notes, comments).
+      - **Output Key:** `"route"`: string ("SQL" or "SEMANTIC")
+
+  **Respond ONLY with a valid JSON object containing these three keys.**
+
+  **Example 1 (SQL Route):**
+  ```json
+  {{
+    "selected_table": "sales",
+    "refined_query": "Calculate the total sales amount for the product 'Laptop' in the month of June 2024.",
+    "route": "SQL"
+  }}
+  
+  **Example 2 (Semantic Route):**
+
+  ```json      
+  {{
+    "selected_table": "products",
+    "refined_query": "Find products with descriptions similar to 'lightweight and portable laptop for travel'.",
+    "route": "SEMANTIC"
+  }}
+
+    
+
+# Prompt for generating the final natural language summary
+generate_final_summary: |
+  Based only on the following retrieved data (which may include SQL results, semantic search snippets, or both), provide a concise and helpful natural language answer to the user's original query. If both SQL and semantic results are present, try to synthesize them. If one or both are empty or irrelevant, state that.
+
+  User Query: "{original_query}"{translated_context}
+
+  Retrieved Data:
+  ---
+  {summary_context}
+  ---
+
+  Answer:

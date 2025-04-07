@@ -2,311 +2,352 @@
 import streamlit as st
 import pandas as pd
 import os
+import time
+import logging
 
 # Import functions from utils.py
 from utils import (
-    setup_environment,
-    get_db_connection,
-    init_qdrant_client,
-    get_llm_wrapper,
-    get_cached_aux_models,
-    get_schema_info,
-    process_uploaded_data,
-    process_natural_language_query,
-    read_google_sheet,
-    table_exists,
+    setup_environment, get_db_connection, init_qdrant_client, get_llm_wrapper,
+    get_cached_aux_models, get_schema_info, process_uploaded_data,
+    process_natural_language_query, table_exists,
+    # Import new management functions
+    get_sqlite_table_row_count, get_qdrant_collection_info,
+    reindex_table, delete_table_data,
+    derive_requirements_from_history,
+    QDRANT_COLLECTION_PREFIX  # Import prefix constant
 )
-import logging
-# --- Custom Logging Filter ---
-class TorchClassesPathFilter(logging.Filter):
-    """Filter out annoying 'Examining the path of torch.classes' errors."""
-    def filter(self, record):
-        # Check if the message originates from the specific problematic check
-        # and contains the known error text.
-        is_watcher_log = record.name.startswith("streamlit.watcher") # Check logger name
-        msg = record.getMessage()
-        is_problem_msg = "Examining the path of torch.classes raised" in msg or \
-                         "Tried to instantiate class '__path__._path'" in msg or \
-                         "no running event loop" in msg # Include the asyncio one too
 
-        # Suppress (return False) only if it's from the watcher AND contains the specific error texts
-        # Allow other messages from the watcher and all messages from other loggers
-        # Careful: Ensure the logger name check is accurate for your setup if errors persist
-        # Sometimes these errors might bubble up to the root logger if not handled.
-        # If suppressing based on name fails, rely only on message content check.
-        # return not is_problem_msg # Alternative: Suppress regardless of source if message matches
-        return not (is_watcher_log and is_problem_msg)
+# --- Config Logging & Filter ---
+# ... (Logging setup including TorchClassesPathFilter as before) ...
 
-# --- Configure Logging ---
-# Get the root logger or a specific Streamlit logger if identifiable
-# Adding to root logger is often effective for these kinds of dispersed warnings
-logger = logging.getLogger() # Get root logger
-# logger = logging.getLogger('streamlit') # Or try the specific streamlit logger
-
-# Set basic logging level (adjust as needed for your own debugging)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(name)s] %(message)s')
-
-# Add the custom filter
-# Check if filter already added to prevent duplicates on Streamlit reruns
-filter_name = "torch_classes_filter"
-if not any(f.name == filter_name for f in logger.filters):
-    custom_filter = TorchClassesPathFilter(name=filter_name)
-    logger.addFilter(custom_filter)
-    logging.info(f"Added '{filter_name}' to logger '{logger.name}' to suppress specific watcher errors.")
-else:
-    logging.debug(f"Filter '{filter_name}' already exists on logger '{logger.name}'.")
-# --- End Logging Setup ---
-
-
-# --- Call set_page_config FIRST ---
-st.set_page_config(layout="wide", page_title="Chat with Your Tabular Data")
 
 # --- Setup Environment and Database Path ---
-# This function now handles path logic and directory creation
 DB_PATH = setup_environment()
-
-# Halt if environment setup failed (e.g., couldn't create directory)
 if not DB_PATH:
-    st.error("CRITICAL ERROR: Failed to initialize application environment (check logs/permissions). Application cannot start.")
-    st.stop() # Stop script execution
+    st.error("CRITICAL ERROR: Failed environment setup.")
+    st.stop()
 
-
-# Order matters less now as they are independent cached resources
+# --- Initialize Backend Resources ---
 db_conn = get_db_connection(DB_PATH)
 qdrant_client = init_qdrant_client()
-llm_wrapper = get_llm_wrapper()         # Get the LLM wrapper instance
-aux_models_dict = get_cached_aux_models() # Get the aux models dictionary
+llm_wrapper = get_llm_wrapper()
+aux_models = get_cached_aux_models()
+
 
 # --- Perform Readiness Checks ---
+print(f"DEBUG [app.py Readiness Check]: Type of aux_models before status check: {type(aux_models)}")
+aux_models_ready = isinstance(aux_models, dict) and aux_models.get("status") == "loaded"
 db_ready = db_conn is not None
 qdrant_ready = qdrant_client is not None
 llm_ready = llm_wrapper and llm_wrapper.is_ready
-aux_models_ready = aux_models_dict and aux_models_dict.get("status") == "loaded"
+aux_models_ready = aux_models and aux_models.get("status") == "loaded"
+
+# Processing requires DB, Qdrant, Embedder(Aux), optionally LLM for column suggestions
+processing_resources_ok = db_ready and qdrant_ready and aux_models_ready  # Add llm_ready if needed
+# Chat requires DB, Qdrant, LLM, Aux (SQL/Embedder)
 core_resources_ok = db_ready and qdrant_ready and llm_ready and aux_models_ready
+
 # --- Initialize Session State ---
 if "messages" not in st.session_state:
     st.session_state.messages = [{"role": "assistant", "content": "Hi! Load data via sidebar, then ask questions."}]
 if "schema" not in st.session_state:
-    # Get initial schema only if DB connection was successful
-    st.session_state.schema = get_schema_info(db_conn) if db_conn else {}
-if "confirm_replace_needed" not in st.session_state: st.session_state.confirm_replace_needed = False
-if "confirm_replace_details" not in st.session_state: st.session_state.confirm_replace_details = {}
-if "process_now_confirmed" not in st.session_state: st.session_state.process_now_confirmed = False # Ensure reset
-# --- Initialize Backend Resources ---
+    st.session_state.schema = get_schema_info(db_conn)
+if "confirm_replace_needed" not in st.session_state:
+    st.session_state.confirm_replace_needed = False
+if "confirm_replace_details" not in st.session_state:
+    st.session_state.confirm_replace_details = {}
+if "process_now_confirmed" not in st.session_state:
+    st.session_state.process_now_confirmed = False
+# Add state for management tab
+if "selected_table_manage" not in st.session_state:
+    st.session_state.selected_table_manage = None
+if "confirm_delete_table" not in st.session_state:
+    st.session_state.confirm_delete_table = None  # Store table name to delete
+
+# --- Define Tabs ---
+tab_chat, tab_data_manage = st.tabs(["💬 Chat", "💾 Data Management"])
+
+# --- Chat Tab ---
+with tab_chat:
+    st.header("Chat with Your Data")
+    st.markdown("Ask questions in natural language about the loaded data.")
+
+    # --- Display Chat History ---
+    current_messages = st.session_state.get("messages", [])
+    for i, message in enumerate(current_messages): # Use enumerate if needing index
+        with st.chat_message(message["role"]):
+            content = message.get("content") # Main summary/response/error
+            raw_display_data = message.get("raw_display_data") # Dict with 'sql' and 'semantic'
+            generated_sql = message.get("generated_sql")
+
+            # Display the main message
+            st.markdown(str(content))
+
+            # --- Expanders for Raw Data and SQL ---
+            expander_key_base = f"detail_expander_{i}" # Unique key prefix per message
+
+            # Show Raw SQL Data if available
+            sql_data = raw_display_data.get("sql") if isinstance(raw_display_data, dict) else None
+            if sql_data is not None and not sql_data.empty:
+                with st.expander("Show Raw SQL Data", expanded=False):
+                    st.dataframe(sql_data, use_container_width=True)
+            elif sql_data is not None and sql_data.empty:
+                with st.expander("Raw SQL Data", expanded=False):                
+                    st.caption("SQL query returned no rows.")
 
 
-# --- Sidebar for Data Input and Management ---
+            # Show Raw Semantic Data if available
+            semantic_data = raw_display_data.get("semantic") if isinstance(raw_display_data, dict) else None
+            if semantic_data and isinstance(semantic_data, list):
+                # Filter out potential "no matches" messages before showing expander
+                valid_semantic_hits = [hit for hit in semantic_data if "No relevant matches found" not in hit]
+                if valid_semantic_hits:
+                    with st.expander("Show Semantic Search Snippets", expanded=False):
+                        for item in valid_semantic_hits:
+                                st.markdown(f"```\n{item}\n```") # Show in code block for clarity
+                elif "No relevant matches found" in semantic_data[0]: # Check if the only item is the "no matches" message
+                    with st.expander("Semantic Search Snippets", expanded=False):
+                        st.caption("Semantic search returned no relevant matches.")
 
-with st.sidebar:
-    st.title("📄 Data Input & Management")
-    st.subheader("Status")
-    # Status checks based on readiness flags
-    if db_ready: st.success(f"DB Connected: `{os.path.basename(DB_PATH)}`")
-    else: st.error(f"DB Connection Failed.")
-    if qdrant_ready: st.success("Qdrant Client Initialized.")
-    else: st.error("Qdrant Client Failed.")
-    if llm_ready: st.success(f"LLM Ready (Mode: {llm_wrapper.mode})")
-    else: st.error(f"Core LLM Failed to Initialize.")
-    if aux_models_ready: st.success("Aux Models (SQL/Embed) Loaded.")
-    else: st.error(f"Aux Models Failed to Load.") # Error logged in utils
 
-    st.markdown("---")
-    # --- Load Data Section ---
-    st.header("1. Load Data Source")
-    uploaded_file = st.file_uploader("Upload Excel File (.xlsx, .xls)", type=["xlsx", "xls"])
-    st.markdown("<p style='text-align: center; color: grey;'>OR</p>", unsafe_allow_html=True)
-    gsheet_published_url = st.text_input("Paste Published Google Sheet CSV URL", help="Use File > Share > Publish to web > CSV format")
+            # Show Generated SQL if available
+            if generated_sql and "-- Error" not in generated_sql: # Don't show if generation failed
+                 with st.expander("Show Executed SQL Query", expanded=False):
+                      st.code(generated_sql, language="sql")
 
-    st.markdown("---")
-    st.header("2. Specify Table Name")
-    table_name_input = st.text_input("Enter Table Name for Database", key="table_name_input_key")
+    # --- Chat Input ---
+    if prompt := st.chat_input("Your question here...", disabled=not core_resources_ok, key="chat_prompt"):
+        if not core_resources_ok:
+            st.error("Cannot process query: Core resources are not ready.")
+        else:
+            # Append user message
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            st.rerun()  # Rerun to display user message immediately
 
-    st.markdown("---")
-    st.header("3. Process Data")
+    # Process the latest user message if it exists
+    if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
+        user_prompt = st.session_state.messages[-1]["content"]
+        # Assume st.session_state.messages contains the conversation history
+        refined_requirements = derive_requirements_from_history(st.session_state.messages, llm_wrapper)
 
-    # --- Confirmation Logic ---
-    confirm_needed = st.session_state.get("confirm_replace_needed", False)
-    confirm_details = st.session_state.get("confirm_replace_details", {})
+        # Optionally, store the refined requirements for debugging:
+        st.session_state.refined_requirements = refined_requirements
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            message_placeholder.markdown("Thinking...")
+            with st.status("Processing query...", expanded=False) as status:
+                # --- Add Type Check Before Call ---
+                print(f"DEBUG [app.py Process Data]: Type of aux_models before passing: {type(aux_models)}")
+                if not isinstance(aux_models, dict): print("ERROR: aux_models IS STRING before process_uploaded_data!")
+                result = process_natural_language_query(
+                    original_query=refined_requirements,
+                    conn=db_conn,
+                    schema=st.session_state.schema,
+                    llm_wrapper=llm_wrapper,
+                    aux_models=aux_models,
+                    qdrant_client=qdrant_client,
+                    max_retries=1
+                )
+                message_for_history = {
+                  "role": "assistant",
+                  "content": result.get("message", "Error: No response message generated."),
+                  "raw_display_data": result.get("raw_display_data"), # Store dict
+                  "generated_sql": result.get("generated_sql"),
+                  # Optionally store status/type for debugging
+                  "status": result.get("status"),
+                  "type": result.get("type")
+                }
+                st.session_state.messages[-1] = message_for_history # Replace user msg
 
-    if confirm_needed and confirm_details.get("table_name") == table_name_input:
-        st.warning(f"Table `{table_name_input}` already exists.")
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("Yes, Replace Table", key="confirm_yes"):
-                st.session_state.confirm_replace_needed = False # Reset flag
-                # Trigger processing with confirmation=True
-                # Store confirmation state temporarily to use after button click
-                st.session_state.process_now_confirmed = True
-                st.rerun() # Rerun to proceed with processing immediately
 
-        with col2:
-            if st.button("No, Cancel", key="confirm_no"):
-                st.session_state.confirm_replace_needed = False
-                st.session_state.confirm_replace_details = {}
-                st.info("Operation cancelled.")
-                st.rerun() # Rerun to clear buttons
-
-    else: # Show the main process button if no confirmation is pending
-        # ... (Check essential resources and disable button if needed) ...
-        
-        process_button_disabled = not core_resources_ok # or not table_name_input etc.
-        disabled_reason = "Processing disabled: Core resources failed." if not core_resources_ok else ""
-        if not table_name_input:
-             process_button_disabled = True
-             disabled_reason += " Enter a table name."
-        if not uploaded_file and not gsheet_published_url:
-             process_button_disabled = True
-             disabled_reason += " Select a data source."
-
-        if disabled_reason: st.warning(disabled_reason.strip())
-
-        process_clicked = st.button("Load and Process Data", disabled=process_button_disabled, key="process_data_button")
-
-        # Check if we just confirmed and should proceed
-        if st.session_state.get("process_now_confirmed", False):
-            process_clicked = True # Treat as if button was just clicked
-            st.session_state.process_now_confirmed = False # Reset flag
-
-        if process_clicked:
-            table_name_to_process = table_name_input # Use current input value
-            
-            replace_is_confirmed = not st.session_state.get("confirm_replace_needed", False) # If confirm needed was false, it's confirmed implicitly or first time
-
-            # Check if table exists *now* before calling process_uploaded_data
-            if db_conn and table_exists(conn=db_conn, table_name=table_name_to_process) and not replace_is_confirmed:
-                # Table exists, but confirmation flow wasn't completed or was reset. Need confirmation.
-                st.session_state.confirm_replace_needed = True
-                st.session_state.confirm_replace_details = {"table_name": table_name_to_process}
-                st.rerun()
-            else:
-                # Proceed with processing (either table doesn't exist or confirmation was given/not needed)
-                with st.spinner("Processing data..."):
-                    success, message = process_uploaded_data(
-                        uploaded_file, gsheet_published_url, table_name_to_process,
-                        db_conn, llm_wrapper, aux_models_dict, qdrant_client,
-                        replace_confirmed=True 
-                    )
-                if message: st.info(f"Processing Log:\n```\n{message}\n```")
-                if success:
-                    st.session_state.schema = get_schema_info(db_conn) # Refresh schema
-                    st.success(f"Data processing completed for table `{table_name_to_process}`.")
-                    # Clear confirmation state if processing was successful
-                    st.session_state.confirm_replace_needed = False
-                    st.session_state.confirm_replace_details = {}
-                    st.rerun()
+                # Display the main message (summary) placeholder update is enough before rerun
+                if result.get("status") == "success":
+                    status.update(label="Query processed!", state="complete")
+                    message_placeholder.markdown(message_for_history["content"])
                 else:
-                    st.error(f"Data processing failed for table `{table_name_to_process}`. See logs.")
-                    # Optionally keep confirmation state? Or clear? Let's clear.
+                    status.update(label="Query failed", state="error", expanded=True)
+                    message_placeholder.error(message_for_history["content"])
+                st.rerun() # Rerun to display fully with expanders
+
+# --- Data Management Tab ---
+with tab_data_manage:
+    st.header("Manage Data Sources")
+
+    # --- Section 1: Load New Data ---
+    with st.expander("Load New Data", expanded=True):
+        uploaded_file = st.file_uploader("Upload Excel File (.xlsx, .xls)", type=["xlsx", "xls"], key="data_upload")
+        st.markdown("<p style='text-align: center; color: grey;'>OR</p>", unsafe_allow_html=True)
+        gsheet_published_url = st.text_input("Paste Published Google Sheet CSV URL", help="Use File > Share > Publish to web > CSV format", key="data_gsheet")
+        table_name_input = st.text_input("Enter Table Name for Database", help="Replaces existing table if name conflicts.", key="data_table_name")
+
+        # Confirmation logic for replacing table
+        confirm_needed = st.session_state.get("confirm_replace_needed", False)
+        confirm_details = st.session_state.get("confirm_replace_details", {})
+
+        # Display confirmation buttons if needed for the *current* input table name
+        if confirm_needed and confirm_details.get("table_name") == table_name_input and table_name_input:
+            st.warning(f"Table `{table_name_input}` already exists.")
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Yes, Replace Table", key="confirm_replace_yes"):
+                    st.session_state.confirm_replace_needed = False
+                    st.session_state.process_now_confirmed = True  # Signal to process
+                    st.rerun()
+            with col2:
+                if st.button("No, Cancel Load", key="confirm_replace_no"):
                     st.session_state.confirm_replace_needed = False
                     st.session_state.confirm_replace_details = {}
-                    # Don't rerun on failure, let user see error
+                    st.info("Load operation cancelled.")
+                    st.rerun()
+        else:
+            # Show primary load button
+            load_disabled = not processing_resources_ok or not table_name_input or (not uploaded_file and not gsheet_published_url)
+            if st.button("Load and Process Data", disabled=load_disabled, key="process_data"):
+                st.session_state.process_now_confirmed = True  # Signal to process (even if no confirmation was shown)
+                st.rerun()
+
+        # Processing Logic (runs after button click + potential confirmation rerun)
+        if st.session_state.get("process_now_confirmed", False):
+            st.session_state.process_now_confirmed = False  # Consume flag
+            current_table_name = table_name_input  # Use name from input field
+            needs_confirm_now = db_ready and table_exists(conn=db_conn, table_name=current_table_name)
+
+            if needs_confirm_now and confirm_details.get("table_name") != current_table_name:
+                # If confirmation needed but wasn't shown for this table, show it now
+                st.session_state.confirm_replace_needed = True
+                st.session_state.confirm_replace_details = {"table_name": current_table_name}
+                st.rerun()
+            elif processing_resources_ok and (not needs_confirm_now or confirm_details.get("table_name") == current_table_name):
+                # Proceed if resources OK AND (table doesn't exist OR confirmation was for this table)
+                with st.spinner("Processing data..."):
+                    # --- Add Type Check Before Call ---
+                    print(f"DEBUG [app.py Process Data]: Type of aux_models before passing: {type(aux_models)}")
+                    if not isinstance(aux_models, dict): print("ERROR: aux_models IS STRING before process_uploaded_data!")
+                    # Pass llm_wrapper for column suggestion
+                    success, message = process_uploaded_data(
+                        uploaded_file, gsheet_published_url, current_table_name,
+                        db_conn, llm_wrapper, aux_models, qdrant_client,
+                        replace_confirmed=True  # Confirmation handled by UI flow
+                    )
+                if message:
+                    st.info(f"Processing Log:\n```\n{message}\n```")
+                if success:
+                    st.session_state.schema = get_schema_info(db_conn)  # Refresh schema
+                    st.success(f"Processing completed for `{current_table_name}`.")
+                    st.session_state.confirm_replace_needed = False  # Clear state
+                    st.session_state.confirm_replace_details = {}
+                    st.rerun()  # Rerun to update UI
+                else:
+                    st.error(f"Processing failed for `{current_table_name}`.")
+                    st.session_state.confirm_replace_needed = False  # Clear state even on fail
+                    st.session_state.confirm_replace_details = {}
 
     st.markdown("---")
-    st.header("ℹ️ Current Database Schema")
-    # (Schema display logic remains the same)
-    if not db_conn: st.warning("Database not connected.")
-    elif not st.session_state.schema: st.info("No tables found. Load data first.")
+
+    # --- Section 2: Database Overview ---
+    st.subheader("Database Status & Overview")
+    current_schema = st.session_state.schema
+    if not db_ready:
+        st.warning("Database not connected.")
+    elif not current_schema:
+        st.info("No tables found in the database.")
     else:
-        for table, columns in st.session_state.schema.items():
-            with st.expander(f"Table: `{table}`"):
+        st.write(f"**Tables found:** {len(current_schema)}")
+        # Prepare data for display table
+        overview_data = []
+        for table_name, columns in current_schema.items():
+            row_count = get_sqlite_table_row_count(db_conn, table_name)
+            qdrant_collection_name = f"{QDRANT_COLLECTION_PREFIX}{table_name}"
+            qdrant_info = get_qdrant_collection_info(qdrant_client, qdrant_collection_name)
+            overview_data.append({
+                "Table Name": table_name,
+                "Columns": len(columns),
+                "SQLite Rows": row_count if row_count is not None else "N/A",
+                "Vector Collection": qdrant_collection_name if qdrant_info else "Not Found",
+                "Vector Points": qdrant_info.get("points_count") if qdrant_info else "N/A",
+                "Vector Dim": qdrant_info.get("vector_size") if qdrant_info else "N/A"
+            })
+        st.dataframe(pd.DataFrame(overview_data), use_container_width=True)
+
+        # Detailed view per table
+        with st.expander("Show Table Details"):
+            for table_name, columns in current_schema.items():
+                st.markdown(f"**Table: `{table_name}`**")
                 st.write("Columns:", ", ".join([f"`{col}`" for col in columns]))
 
+    st.markdown("---")
 
-# --- Main Chat Area ---
-st.title("💬 Chat with Your Data")
-st.markdown("Ask questions in natural language about the loaded data.")
-# --- DEBUGGING LINE ---
-st.sidebar.subheader("DEBUG: Session Messages") # Display in sidebar to avoid clutter
-st.sidebar.json(st.session_state.messages) # Show the JSON representation
-# Or print to console:
-# print("DEBUG: Current messages:", st.session_state.messages)
-# --- END DEBUGGING LINE ---
-
-
-# Display chat messages from history
-for message in st.session_state.messages:
-    # Add a check to handle non-dictionary items gracefully
-    if isinstance(message, dict) and "role" in message:
-        with st.chat_message(message["role"]):
-            content = message.get("content")
-            # Display based on content type (DataFrame, List, or String)
-            if isinstance(content, pd.DataFrame):
-                st.dataframe(content, use_container_width=True)
-            elif isinstance(content, list):
-                for item in content:
-                    st.markdown(f"- {item}")
-            else:
-                st.markdown(str(content)) # Ensure content is string
+    # --- Section 3: Manage Existing Tables ---
+    st.subheader("Manage Existing Tables")
+    if not current_schema:
+        st.info("Load data first to manage tables.")
     else:
-        # If it's not a dict or lacks 'role', display a warning/debug message
-        st.warning(f"Skipping invalid message format in history: `{type(message)}`, Value: `{message}`")
-        print(f"WARNING: Invalid message format found: {type(message)}, Value: {message}") # Also print to console
-# Accept user input (disable if essential resources missing)
-chat_input_disabled = not core_resources_ok
-prompt_disabled_reason = "Chat disabled: DB, Qdrant, or Models failed." if chat_input_disabled else "Your question here..."
+        table_options = list(current_schema.keys())
+        # Use session state to preserve selection across reruns
+        if st.session_state.selected_table_manage not in table_options:
+            st.session_state.selected_table_manage = table_options[0]  # Default to first
 
-if prompt := st.chat_input(prompt_disabled_reason, disabled=chat_input_disabled):
-    # (Chat processing logic remains the same)
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+        selected_table = st.selectbox(
+            "Select Table to Manage:",
+            options=table_options,
+            key="selected_table_manage"  # Use key to bind to session state
+        )
 
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        message_placeholder.markdown("Thinking...")
-        # Check resources again just before processing
-        if not core_resources_ok:
-             message_placeholder.error("Cannot process query: Essential resources (DB, Qdrant, Models) are not available.")
-             st.session_state.messages.append({"role": "assistant", "content": "Error: Cannot process query due to initialization failure."})
-        else:
-            with st.status("Processing your query...", expanded=False) as status:
-                result = process_natural_language_query(
-                    prompt, db_conn, st.session_state.schema, llm_wrapper, aux_models_dict, qdrant_client
-                )
-                # ... (Result handling logic is the same) ...
-                if result["status"] == "success":
-                    status.update(label="Query processed!", state="complete", expanded=False)
-                    # ... (display SQL/Semantic results as before) ...
-                    response_content = result.get("data")
-                    summary = result.get("message", "Processing complete.")
-                    history_content = summary
-                    if result["type"] == "SQL":
-                        if isinstance(response_content, pd.DataFrame):
-                            history_content = f"Found {len(response_content)} results via SQL."
-                            # Display DataFrame WITHIN the chat message
-                            st.dataframe(response_content, use_container_width=True)
-                            message_placeholder.empty() # Clear "Thinking..."
-                            # --- MOVE EXPANDER OUTSIDE or DISPLAY DIFFERENTLY ---
-                            # Option A: Display SQL outside the chat bubble (simpler)
-                            # (Code below would go AFTER the `with st.chat_message(...)` block if desired)
+        if selected_table:
+            st.markdown(f"**Actions for table: `{selected_table}`**")
+            col1, col2, col3 = st.columns(3)
 
-                            # Option B: Display inside but check context carefully
-                            # If the parent is st.status, it might be okay? Test it.
-                            # If the parent is another expander, DEFINITELY move it.
+            with col1:  # View Data
+                if st.button(f"View Sample Data", key=f"view_{selected_table}"):
+                    try:
+                        sample_df = pd.read_sql_query(f"SELECT * FROM {selected_table} LIMIT 10", db_conn)
+                        st.dataframe(sample_df, use_container_width=True)
+                    except Exception as e:
+                        st.error(f"Failed to read sample data: {e}")
 
-                        else: # Handle unexpected SQL data format
-                            history_content = "Received unexpected data format for SQL result."
-                            message_placeholder.warning(history_content)
-                    elif result["type"] == "SEMANTIC":
-                         # ... (Semantic display) ...
-                         if isinstance(response_content, list):
-                             history_content = f"Found {len(response_content)} semantic results. Details above."
-                             for item in response_content: st.markdown(f"- {item}")
-                             message_placeholder.empty()
-                         else:
-                             history_content = "Received unexpected data format for Semantic result."
-                             message_placeholder.warning(history_content)
+            with col2:  # Re-index
+                if st.button(f"🔄 Re-index Vectors", key=f"reindex_{selected_table}", help="Re-calculates and replaces vector embeddings for this table."):
+                    if processing_resources_ok and llm_ready:
+                        with st.spinner(f"Re-indexing '{selected_table}'... This may take time."):
+                            # --- Add Type Check Before Call ---
+                            print(f"DEBUG [app.py Process Data]: Type of aux_models before passing: {type(aux_models)}")
+                            if not isinstance(aux_models, dict): print("ERROR: aux_models IS STRING before process_uploaded_data!")
+                            reindex_success, reindex_msg = reindex_table(
+                                db_conn, selected_table, llm_wrapper, aux_models, qdrant_client
+                            )
+                        if reindex_success:
+                            st.success(reindex_msg)
+                        else:
+                            st.error(reindex_msg)
+                        st.rerun()  # Refresh overview
                     else:
-                        history_content = str(response_content)
-                        message_placeholder.markdown(history_content)
-                    st.session_state.messages.append({"role": "assistant", "content": history_content})
+                        st.error("Cannot re-index: Core resources (DB, Qdrant, Models, LLM) not ready.")
 
-                else: # Handle errors
-                    status.update(label="Query failed", state="error", expanded=True)
-                    error_message = result.get("message", "An unknown error occurred.")
-                    message_placeholder.error(error_message)
-                    st.session_state.messages.append({"role": "assistant", "content": f"Error: {error_message}"})
+            with col3:  # Delete
+                delete_key = f"delete_{selected_table}"
+                # Confirmation logic for delete
+                if st.session_state.get("confirm_delete_table") == selected_table:
+                    st.error(f"⚠️ Confirm Deletion of `{selected_table}`?")
+                    if st.button("YES, DELETE (Permanent)", key=f"confirm_delete_yes_{selected_table}", type="primary"):
+                        with st.spinner(f"Deleting '{selected_table}' data..."):
+                            delete_success, delete_msg = delete_table_data(db_conn, selected_table, qdrant_client)
+                        if delete_success:
+                            st.success(delete_msg)
+                        else:
+                            st.error(delete_msg)
+                        # Clear state and refresh
+                        st.session_state.confirm_delete_table = None
+                        st.session_state.selected_table_manage = None  # Reset selection
+                        st.session_state.schema = get_schema_info(db_conn)  # Update schema
+                        st.rerun()
+                    if st.button("Cancel Deletion", key=f"confirm_delete_no_{selected_table}"):
+                        st.session_state.confirm_delete_table = None
+                        st.rerun()
+                else:
+                    if st.button(f"❌ Delete Table Data", key=delete_key, type="secondary", help="Permanently deletes table from SQL and vector data."):
+                        # Set state to trigger confirmation on next rerun
+                        st.session_state.confirm_delete_table = selected_table
+                        st.rerun()
 
-# --- Footer ---
-st.markdown("---")
-st.caption("Powered by Streamlit, SQLite, Qdrant, Google Auth, etc. (Simulated Models)")
+# --- Footer (Optional) ---
+# st.caption("...")

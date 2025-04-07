@@ -14,20 +14,30 @@ except ImportError:
     llama_cpp_available_for_aux = False
     logging.warning("llama_cpp library not found. Cannot load GGUF SQL model.")
 
-# --- Configuration ---
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Set up a succinct logging format
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s: %(message)s',
+    datefmt='%H:%M:%S'
+)
 
-# Load environment variables (ensure HF_TOKEN is loaded if needed for private models)
+# Load environment variables
 dotenv.load_dotenv('.env', override=True)
 HF_TOKEN = os.getenv('HF_TOKEN')
-print("Attempting to load models...")
-if HF_TOKEN:
-    print("Using HF_TOKEN for potentially gated models.")
-else:
-    print("HF_TOKEN not found in environment. Only public models will work.")
+logging.info("Loading auxiliary models...")
 
-# --- Auxiliary Model Loading Function ---
+# --- Helper function for succinct logging ---
+def log_key(message):
+    logging.info(message)
+
+try:
+    from llama_cpp import Llama
+    llama_cpp_available_for_aux = True
+except ImportError:
+    llama_cpp_available_for_aux = False
+    logging.warning("llama_cpp not installed; SQL GGUF model will not load.")
+
 
 # --- Auxiliary Model Loading Function (Revised for GGUF SQL Model) ---
 def load_aux_models():
@@ -130,8 +140,8 @@ def load_aux_models():
         models_dict['status'] = 'loaded'
         logging.info("All auxiliary models loaded successfully.")
     elif sql_model_loaded or embed_model_loaded:
-         models_dict['status'] = 'partial'
-         logging.warning("Some auxiliary models failed to load.")
+        models_dict['status'] = 'partial'
+        logging.warning("Some auxiliary models failed to load.")
     else:
         models_dict['status'] = 'error'
         # Consolidate error messages if available
@@ -150,20 +160,20 @@ if __name__ == "__main__":
     print(f"\nAux models loading status: {aux_models.get('status')}")
 
     if aux_models.get('sql_gguf_model'):
-         print("SQL GGUF model appears loaded.")
-         # Add a simple generation test if desired
-         try:
-             sql_llm = aux_models['sql_gguf_model']
-             test_sql_prompt = "SELECT COUNT(*) FROM employees;" # Simple prompt
-             print(f"\nTesting SQL GGUF with prompt: '{test_sql_prompt}'")
-             output = sql_llm(test_sql_prompt, max_tokens=50, temperature=0.1)
-             print("SQL GGUF Response:", output)
-         except Exception as e:
-             print(f"Error during SQL GGUF test generation: {e}")
+        print("SQL GGUF model appears loaded.")
+        # Add a simple generation test if desired
+        try:
+            sql_llm = aux_models.get('sql_gguf_model')
+            test_sql_prompt = "SELECT COUNT(*) FROM employees;" # Simple prompt
+            print(f"\nTesting SQL GGUF with prompt: '{test_sql_prompt}'")
+            output = sql_llm(test_sql_prompt, max_tokens=50, temperature=0.1)
+            print("SQL GGUF Response:", output)
+        except Exception as e:
+            print(f"Error during SQL GGUF test generation: {e}")
 
     if aux_models.get('embedding_model'):
-         print("Embedding model appears loaded.")
-         # Add embedding test if desired
+        print("Embedding model appears loaded.")
+        # Add embedding test if desired
 
     if aux_models.get('status') != 'loaded':
         print("\nError:", aux_models.get('error_message', 'Unknown loading error'))
