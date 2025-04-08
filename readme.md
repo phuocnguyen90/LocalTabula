@@ -49,6 +49,7 @@ This Streamlit web app lets you upload tabular data (Excel files or published Go
 
     ```python
     pip install -r requirements.txt
+    ```
 
     For GPU acceleration, install llama-cpp-python with appropriate compilation flags (see llama-cpp-python docs).
 
@@ -67,12 +68,10 @@ Copy and edit .env.example to create your .env file. Key variables include:
 ## Running the Application
 
 # Start the App:
-
     ```bash
     streamlit run app.py
-    ```
 
-    Open your browser at the URL provided by Streamlit (typically http://localhost:8501).
+Open your browser at the URL provided by Streamlit (typically http://localhost:8501).
 
 ## Usage
 

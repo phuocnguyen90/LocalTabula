@@ -158,17 +158,41 @@ class LLMWrapper:
                     return "Error: Local GGUF model not loaded."
 
                 logging.info(f"Generating with local GGUF model...")
-                output = self.local_model(
-                    prompt,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    # stop=["\nUser:"] # Example stop sequence
-                )
-                if output and 'choices' in output and len(output['choices']) > 0:
-                    return output['choices'][0]['text'].strip()
-                else:
-                    logging.warning(f"Local GGUF model returned unexpected output: {output}")
-                    return "Error: Received unexpected output from local model."
+                try:
+                    response = self.local_model.create_chat_completion(
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        # stop=["<|end_of_turn|>", "<|user|>"] # Adjust stop tokens for Gemma 3 if needed
+                    )
+                    if response and 'choices' in response and len(response['choices']) > 0:
+                        content = response['choices'][0]['message']['content']
+                        return content.strip() if content else "Error: Received empty content from local model."
+                    else:
+                         logging.warning(f"Local GGUF model chat completion returned unexpected structure: {response}")
+                         return "Error: Unexpected output from local model chat completion."
+
+                except Exception as e:
+                    # Fallback to simple invocation if create_chat_completion fails (e.g., older llama-cpp)
+                    # Or if templating isn't working as expected
+                    logging.warning(f"create_chat_completion failed ({e}), trying direct invocation...")
+                    try:
+                        output = self.local_model(
+                            prompt,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            # stop=["<|end_of_turn|>", "<|user|>"] # Stop tokens might be needed here too
+                        )
+                        if output and 'choices' in output and len(output['choices']) > 0:
+                            return output['choices'][0]['text'].strip()
+                        else:
+                            logging.warning(f"Local GGUF model direct invocation returned unexpected output: {output}")
+                            return "Error: Received unexpected output from local model direct invocation."
+                    except Exception as e2:
+                        logging.error(f"Both chat completion and direct invocation failed for local GGUF: {e2}", exc_info=True)
+                        return f"Error: Failed to generate response from local model ({type(e2).__name__})."
+
+
 
         # Handle specific API errors if using openai library
         except AuthenticationError as e:

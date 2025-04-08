@@ -9,10 +9,12 @@ from llama_cpp import Llama
 import uuid
 import json
 import dotenv
+import numpy as np
 # --- NEW: Load environment variables from .env file ---
 from dotenv import load_dotenv
 import yaml # <-- NEW: Import YAML
 import logging
+import uuid
 import traceback # For detailed error logging in query processing
 
 # --- Imports for Google Auth (If needed, keep commented otherwise) ---
@@ -158,69 +160,79 @@ def get_cached_aux_models():
     return models_dict_from_loader
 
 
-# --- Helper function to suggest semantic columns ---
 def _suggest_semantic_columns(df_head: pd.DataFrame, schema: dict, table_name: str, llm_wrapper: LLMWrapper) -> list[str]:
     """
     Uses the LLM to suggest columns suitable for semantic search embedding.
-    Loads prompt from PROMPTS.
+    Loads prompt from PROMPTS and cleans LLM response markdown.
     """
     logging.info(f"Requesting LLM suggestion for semantic columns in table '{table_name}'...")
     if not llm_wrapper or not llm_wrapper.is_ready:
         logging.warning("LLM wrapper not ready for semantic column suggestion. Falling back to simple text column selection.")
         return df_head.select_dtypes(include=['object', 'string']).columns.tolist()
 
-    # Prepare prompt using loaded template
     schema_str = json.dumps(schema.get(table_name, "Schema unavailable"), indent=2)
     df_head_str = df_head.to_string(index=False, max_rows=5)
 
-    # --- Use loaded prompt ---
     prompt = PROMPTS['suggest_semantic_columns'].format(
         table_name=table_name,
         schema_str=schema_str,
         df_head_str=df_head_str
     )
-    # --- End Use loaded prompt ---
-
     logging.debug(f"Sending semantic column suggestion prompt to LLM:\n{prompt}")
 
     suggested_columns = []
+    raw_llm_output = None # Store raw output for debugging
     try:
         if llm_wrapper.mode == 'openrouter':
-            structured_result = llm_wrapper.generate_structured_response(prompt)
-            if structured_result and isinstance(structured_result, list) and all(isinstance(item, str) for item in structured_result):
-                 suggested_columns = structured_result
-                 logging.info(f"LLM suggested (structured): {suggested_columns}")
-            else:
-                logging.warning(f"LLM structured response failed or returned non-list: {structured_result}. Attempting text fallback.")
-                response_text = llm_wrapper.generate_response(prompt + " []", max_tokens=150)
-                try:
-                    parsed_list = json.loads(response_text)
-                    if isinstance(parsed_list, list) and all(isinstance(item, str) for item in parsed_list):
-                        suggested_columns = parsed_list
-                        logging.info(f"LLM suggested (text fallback parsed): {suggested_columns}")
-                    else:
-                         logging.warning(f"LLM text response could not be parsed into valid list of strings: {response_text}")
-                except json.JSONDecodeError:
-                     logging.warning(f"LLM text response was not valid JSON: {response_text}")
-        else: # If not OpenRouter or structured failed, use standard text generation
-             response_text = llm_wrapper.generate_response(prompt + ' []', max_tokens=150)
-             logging.debug(f"Raw text suggestion response: {response_text}")
-             cleaned_text = response_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+             # Use generate_response for consistency and handle markdown cleaning below
+             raw_llm_output = llm_wrapper.generate_response(prompt + " []", max_tokens=150) # Add default if empty
+             logging.debug(f"Raw OpenRouter text suggestion response: {raw_llm_output}")
+             # --- FIX: Clean Markdown before parsing JSON ---
+             cleaned_text = raw_llm_output.strip()
+             if cleaned_text.startswith("```json"): cleaned_text = cleaned_text[7:]
+             if cleaned_text.startswith("```"): cleaned_text = cleaned_text[3:]
+             if cleaned_text.endswith("```"): cleaned_text = cleaned_text[:-3]
+             cleaned_text = cleaned_text.strip()
+
              try:
                  parsed_list = json.loads(cleaned_text)
                  if isinstance(parsed_list, list) and all(isinstance(item, str) for item in parsed_list):
                      suggested_columns = parsed_list
-                     logging.info(f"LLM suggested (parsed from text): {suggested_columns}")
-                 else: logging.warning(f"Parsed text response was not a valid list of strings: {parsed_list}")
-             except json.JSONDecodeError:
-                  logging.warning(f"Could not parse LLM text response as JSON: '{cleaned_text}'")
+                     logging.info(f"LLM suggested (parsed from OpenRouter text): {suggested_columns}")
+                 else:
+                     logging.warning(f"Parsed OpenRouter text response was not a valid list of strings: {parsed_list}")
+             except json.JSONDecodeError as e:
+                 logging.error(f"Failed to parse JSON response from OpenRouter text: {e}")
+                 logging.error(f"Invalid JSON received: {cleaned_text}") # Log the cleaned text
+                 # Optionally try a fallback or raise error
+        else: # Local GGUF mode
+             raw_llm_output = llm_wrapper.generate_response(prompt + ' []', max_tokens=150)
+             logging.debug(f"Raw GGUF text suggestion response: {raw_llm_output}")
+             # --- FIX: Clean Markdown before parsing JSON ---
+             cleaned_text = raw_llm_output.strip()
+             if cleaned_text.startswith("```json"): cleaned_text = cleaned_text[7:]
+             if cleaned_text.startswith("```"): cleaned_text = cleaned_text[3:]
+             if cleaned_text.endswith("```"): cleaned_text = cleaned_text[:-3]
+             cleaned_text = cleaned_text.strip()
+
+             try:
+                 parsed_list = json.loads(cleaned_text)
+                 if isinstance(parsed_list, list) and all(isinstance(item, str) for item in parsed_list):
+                     suggested_columns = parsed_list
+                     logging.info(f"LLM suggested (parsed from GGUF text): {suggested_columns}")
+                 else:
+                      logging.warning(f"Parsed GGUF text response was not a valid list of strings: {parsed_list}")
+             except json.JSONDecodeError as e:
+                  logging.error(f"Could not parse GGUF LLM text response as JSON: {e}")
+                  logging.error(f"Invalid JSON (GGUF): '{cleaned_text}'")
+
 
     except Exception as e:
         logging.error(f"Error during LLM semantic column suggestion: {e}", exc_info=True)
 
     # Final fallback & validation
     if not suggested_columns:
-        logging.warning("LLM suggestion failed. Falling back to selecting all object/string columns.")
+        logging.warning("LLM suggestion failed or returned empty. Falling back to selecting all object/string columns.")
         suggested_columns = df_head.select_dtypes(include=['object', 'string']).columns.tolist()
 
     final_columns = [col for col in suggested_columns if col in df_head.columns]
@@ -230,133 +242,261 @@ def _suggest_semantic_columns(df_head: pd.DataFrame, schema: dict, table_name: s
     logging.info(f"Final semantic columns selected for embedding: {final_columns}")
     return final_columns
 
-
-# --- Simplified placeholder (no longer uses LLM simulation here) ---
-# def _analyze_columns_for_embedding(df, table_name, models): # Placeholder REMOVED
-#     print(f"Simulating analysis for {table_name}")
-#     time.sleep(0.1); return df.select_dtypes(include=['object']).columns[:1].tolist()
-
-
 def _embed_and_index_data(df: pd.DataFrame, table_name: str, semantic_columns: list, aux_models: dict, qdrant_client: QdrantClient):
     """
     Embeds specified semantic columns and indexes them in Qdrant.
-    (No changes needed here related to prompts)
+    Uses UUIDs for Qdrant point IDs universally.
+    Stores original meaningful ID in payload.
+    Includes enhanced logging.
     """
+    logging.info(f"Starting embedding and indexing process for table '{table_name}'...")
+
     # --- Readiness Checks ---
-    if not qdrant_client: return False, "Qdrant client not initialized."
+    if not qdrant_client:
+        logging.error(f"[{table_name}] Qdrant client not available. Aborting indexing.")
+        return False, "Qdrant client not initialized."
     if not aux_models or aux_models.get('status') != 'loaded' or not aux_models.get('embedding_model'):
+        logging.error(f"[{table_name}] Embedding model not loaded or aux models failed. Aborting indexing.")
         return False, "Embedding model not loaded or aux models failed."
 
     embedding_model = aux_models.get('embedding_model')
-    if df.empty: return True, "DataFrame is empty." # Not an error
-    if not semantic_columns: return True, "No semantic columns specified." # Not an error
+    if df.empty:
+        logging.info(f"[{table_name}] DataFrame is empty. Skipping embedding and collection creation.")
+        return True, "DataFrame is empty."
+    if not semantic_columns:
+        logging.warning(f"[{table_name}] No semantic columns specified. Skipping embedding and collection creation.")
+        return True, "No semantic columns specified."
 
     valid_semantic_cols = [col for col in semantic_columns if col in df.columns]
-    if not valid_semantic_cols: return True, "Specified semantic columns not found in DataFrame."
+    logging.info(f"[{table_name}] Valid semantic columns found in DataFrame: {valid_semantic_cols}")
+    if not valid_semantic_cols:
+        logging.warning(f"[{table_name}] Valid semantic columns list is empty. Skipping embedding.")
+        return True, "Valid semantic columns list is empty."
 
-    logging.info(f"Starting embedding and indexing for table '{table_name}', columns: {valid_semantic_cols}")
+    logging.info(f"[{table_name}] Proceeding with embedding for columns: {valid_semantic_cols}")
     collection_name = f"{QDRANT_COLLECTION_PREFIX}{table_name}"
     status_messages = []
-    is_in_memory = qdrant_client.connection_params.host is None and qdrant_client.connection_params.port is None and qdrant_client.connection_params.path == ":memory:"
-    id_strategy = "UUID" if is_in_memory else "PK_or_Index"
-    logging.info(f"Qdrant client type: {'In-memory' if is_in_memory else 'Persistent'}. ID strategy: {id_strategy}")
+
+    # --- Universal UUID Strategy for Qdrant Point IDs ---
+    logging.info(f"[{table_name}] Using UUIDs for Qdrant point IDs.")
 
     try:
         documents_to_embed = []
         payloads = []
-        point_ids = []
+        point_ids = [] # These will ALWAYS be UUIDs now
 
-        potential_pk = next((col for col in df.columns if col.lower() == 'id'), df.columns[0] if df.columns[0].lower() in ['id', 'pk', 'key'] else None)
-        logging.info(f"Potential primary key column identified: {potential_pk}")
+        potential_pk = None
+        if not df.columns.empty:
+             potential_pk = next((col for col in df.columns if col.lower() == 'id'),
+                                 df.columns[0] if df.columns[0].lower() in ['id', 'pk', 'key'] else None)
+        logging.info(f"[{table_name}] Potential primary key column identified: {potential_pk}")
 
+        logging.info(f"[{table_name}] Preparing documents for embedding from {len(df)} rows...")
+        rows_with_text = 0
         for index, row in df.iterrows():
             text_parts = [f"{col}: {row[col]}" for col in valid_semantic_cols if pd.notna(row[col]) and str(row[col]).strip()]
             if not text_parts: continue
-
+            rows_with_text += 1
             doc_text = " | ".join(text_parts)
+
             payload = row.to_dict()
             for k, v in payload.items():
-                if pd.isna(v): payload[k] = None
-
+                 if pd.isna(v): payload[k] = None
             payload["_table_name"] = table_name
             payload["_source_text"] = doc_text
 
-            point_id_value = None
-            original_id_value = f"{table_name}_idx_{index}" # Default original ID
-
+            # --- Determine Original Meaningful ID (for payload) ---
+            original_id_value = f"{table_name}_idx_{index}" # Default
             if potential_pk and potential_pk in row and pd.notna(row[potential_pk]):
-                original_id_value = f"{table_name}_{row[potential_pk]}"
+                try:
+                     pk_val_str = str(row[potential_pk])
+                     # Basic sanitization for common problematic chars if needed for display ID
+                     # pk_val_str_sanitized = pk_val_str.replace(" ", "_").replace("/", "-")
+                     original_id_value = f"{table_name}_{pk_val_str}"
+                except Exception as pk_str_err:
+                     logging.warning(f"[{table_name}] Could not convert PK '{row[potential_pk]}' to string for payload ID (Row {index}): {pk_str_err}. Using index fallback.")
+                     original_id_value = f"{table_name}_idx_{index}"
+            # --- Store Original ID in Payload ---
+            payload["_original_id"] = original_id_value
+            # --- End Original ID Logic ---
 
-            payload["_original_id"] = original_id_value # Store original ID in payload
+            # --- Generate UUID for Qdrant Point ID ---
+            qdrant_point_id = str(uuid.uuid4())
+            # --- End Qdrant Point ID Logic ---
 
-            if is_in_memory:
-                point_id_value = str(uuid.uuid4()) # Generate UUID for in-memory
-            else:
-                point_id_value = original_id_value # Use PK-based ID for persistent
-
-            if point_id_value is None:
-                logging.warning(f"Failed to generate point ID for row index {index}. Skipping.")
-                continue
-
-            point_ids.append(point_id_value)
+            point_ids.append(qdrant_point_id) # Add the UUID to the list for Qdrant
             payloads.append(payload)
             documents_to_embed.append(doc_text)
 
+        logging.info(f"[{table_name}] Prepared {len(documents_to_embed)} documents from {rows_with_text} rows with text.")
         if not documents_to_embed:
-            logging.info(f"No documents found to embed for table '{table_name}'.")
+            logging.warning(f"[{table_name}] No non-empty documents found to embed. Skipping embedding.")
             return True, "No non-empty documents to embed."
 
-        logging.info(f"Generating {len(documents_to_embed)} embeddings...")
-        embeddings = list(embedding_model.embed(documents_to_embed))
-        if not embeddings or len(embeddings) != len(documents_to_embed):
-            return False, "Embedding generation failed or returned incorrect number of vectors."
-        logging.info("Embeddings generated.")
+        # --- Get Embeddings ---
+        logging.info(f"[{table_name}] Generating {len(documents_to_embed)} embeddings...")
+        try:
+            embeddings_result = embedding_model.embed(documents_to_embed)
+            if not isinstance(embeddings_result, (list, np.ndarray)):
+                 embeddings = list(embeddings_result)
+                 logging.info(f"[{table_name}] Converted embedding result from {type(embeddings_result)} to list.")
+            else:
+                 embeddings = embeddings_result
 
-        vector_size = len(embeddings[0])
-        logging.info(f"Vector size: {vector_size}")
+            embedding_count = len(embeddings) if embeddings is not None else 0
+            logging.info(f"[{table_name}] Embedding generation completed. Received {embedding_count} embeddings.")
+            if not embeddings or embedding_count != len(documents_to_embed):
+                 logging.error(f"[{table_name}] Embedding failed or returned incorrect count ({embedding_count} vs {len(documents_to_embed)}). Aborting.")
+                 return False, "Embedding failed or returned incorrect number of vectors."
+        except Exception as embed_e:
+            logging.error(f"[{table_name}] Error during embedding call: {embed_e}", exc_info=True)
+            return False, f"Embedding generation failed: {embed_e}"
 
+        # --- Get Vector Size ---
+        try:
+            vector_size = len(embeddings[0])
+            logging.info(f"[{table_name}] Determined vector size: {vector_size}")
+        except IndexError:
+             logging.error(f"[{table_name}] Failed to get vector size from empty embeddings list. Aborting.")
+             return False, "Failed to get vector size from embeddings."
+        except Exception as size_e:
+             logging.error(f"[{table_name}] Error determining vector size: {size_e}", exc_info=True)
+             return False, f"Error determining vector size: {size_e}"
+
+        # --- Collection Handling ---
+        logging.info(f"[{table_name}] Checking/Creating Qdrant collection '{collection_name}'...")
         try:
             qdrant_client.get_collection(collection_name=collection_name)
-            logging.warning(f"Qdrant collection '{collection_name}' already exists. Recreating.")
+            logging.warning(f"[{table_name}] Collection '{collection_name}' exists. Recreating.")
             qdrant_client.delete_collection(collection_name=collection_name, timeout=10)
             status_messages.append(f"Recreated collection '{collection_name}'.")
-            time.sleep(0.5) # Brief pause after delete
+            time.sleep(0.5)
         except Exception:
-             logging.info(f"Qdrant collection '{collection_name}' not found. Creating new.")
-             status_messages.append(f"Creating collection '{collection_name}'.")
+             logging.info(f"[{table_name}] Collection '{collection_name}' not found. Will create new.")
 
-        qdrant_client.create_collection(
-            collection_name=collection_name,
-            vectors_config=models.VectorParams(size=vector_size, distance=models.Distance.COSINE)
-        )
-        logging.info(f"Qdrant collection '{collection_name}' created/ensured.")
+        try:
+            logging.info(f"[{table_name}] Attempting creation of '{collection_name}' size {vector_size}...")
+            qdrant_client.create_collection(
+                collection_name=collection_name,
+                vectors_config=models.VectorParams(size=vector_size, distance=models.Distance.COSINE)
+            )
+            logging.info(f"[{table_name}] Successfully created/ensured collection '{collection_name}'.")
+            status_messages.append(f"Created collection '{collection_name}'.")
+        except Exception as create_e:
+             logging.error(f"[{table_name}] Failed to create Qdrant collection '{collection_name}': {create_e}", exc_info=True)
+             return False, f"Failed to create Qdrant collection: {create_e}"
 
+        # --- Upsert data ---
         batch_size = 100
         num_batches = (len(point_ids) + batch_size - 1) // batch_size
-        logging.info(f"Upserting {len(point_ids)} points to Qdrant in {num_batches} batches...")
-
+        logging.info(f"[{table_name}] Upserting {len(point_ids)} points to Qdrant in {num_batches} batches...")
         for i in range(num_batches):
             start_idx = i * batch_size
             end_idx = min((i + 1) * batch_size, len(point_ids))
-            batch_ids = point_ids[start_idx:end_idx]
-            batch_vectors = embeddings[start_idx:end_idx]
+            batch_ids = point_ids[start_idx:end_idx] # Use UUIDs here
+            batch_vectors = [list(map(float, vec)) for vec in embeddings[start_idx:end_idx]]
             batch_payloads = payloads[start_idx:end_idx]
 
-            qdrant_client.upsert(
-                collection_name=collection_name,
-                points=models.Batch(ids=batch_ids, vectors=batch_vectors, payloads=batch_payloads),
-                wait=True
-            )
-        logging.info("Qdrant upsert complete.")
+            logging.debug(f"[{table_name}] Upserting batch {i+1}/{num_batches} (size {len(batch_ids)})")
+            try:
+                qdrant_client.upsert(
+                    collection_name=collection_name,
+                    points=models.Batch(
+                        ids=batch_ids, # These are now UUIDs
+                        vectors=batch_vectors,
+                        payloads=batch_payloads
+                    ),
+                    wait=True
+                )
+            except Exception as upsert_e:
+                 logging.error(f"[{table_name}] Error upserting batch {i+1} to Qdrant: {upsert_e}", exc_info=True)
+                 return False, f"Error during Qdrant upsert: {upsert_e}"
+
+        logging.info(f"[{table_name}] Qdrant upsert complete.")
         status_messages.append(f"Indexed {len(point_ids)} points.")
         return True, "\n".join(status_messages)
 
     except Exception as e:
-        logging.error(f"Error during embedding/indexing for table {table_name}: {e}", exc_info=True)
-        return False, f"Error during indexing: {e}"
+        logging.error(f"[{table_name}] Unexpected error during embedding/indexing: {e}", exc_info=True)
+        return False, f"Unexpected error during indexing: {e}"
 
 
-# --- REVISED process_uploaded_data ---
+# --- utils.py ---
+# utils.py
+
+from qdrant_client import QdrantClient, models # Ensure models is imported
+
+# ... other code ...
+
+def get_qdrant_collection_info(qdrant_client: QdrantClient, collection_name: str) -> dict | None:
+    """Gets point count and vector dimension for a Qdrant collection."""
+    if not qdrant_client: return None
+    try:
+        info = qdrant_client.get_collection(collection_name=collection_name)
+
+        # --- Extract basic info safely ---
+        points_count = getattr(info, 'points_count', 0)
+        vectors_count = getattr(info, 'vectors_count', 0)
+        status = getattr(info, 'status', 'Unknown')
+        logging.debug(f"[{collection_name}] Raw CollectionInfo attributes: {dir(info)}") # Log all attributes
+
+        # --- Attempt to find vector size in different potential locations ---
+        vec_size = "N/A"
+        vectors_config_obj = getattr(info, 'vectors_config', None)
+        config_obj = getattr(info, 'config', None)
+
+        # 1. Standard location (info.vectors_config)
+        if isinstance(vectors_config_obj, models.VectorParams):
+             vec_size = getattr(vectors_config_obj, 'size', 'N/A')
+             logging.debug(f"[{collection_name}] Vector size found in info.vectors_config")
+        elif isinstance(vectors_config_obj, dict): # Named vectors
+            first_vec_name = next(iter(vectors_config_obj), None)
+            if first_vec_name and isinstance(vectors_config_obj[first_vec_name], models.VectorParams):
+                vec_size = getattr(vectors_config_obj[first_vec_name], 'size', 'N/A')
+                logging.debug(f"[{collection_name}] Vector size found in info.vectors_config (named)")
+
+        # 2. Nested location (info.config.params.vectors - check structure carefully)
+        # This structure might vary greatly depending on client version and type
+        elif config_obj and hasattr(config_obj, 'params') and hasattr(config_obj.params, 'vectors'):
+             vectors_param = getattr(config_obj.params, 'vectors', None)
+             if isinstance(vectors_param, models.VectorParams):
+                  vec_size = getattr(vectors_param, 'size', 'N/A')
+                  logging.debug(f"[{collection_name}] Vector size found in info.config.params.vectors")
+             elif isinstance(vectors_param, dict): # Named vectors under config.params
+                  first_vec_name = next(iter(vectors_param), None)
+                  if first_vec_name and isinstance(vectors_param[first_vec_name], models.VectorParams):
+                       vec_size = getattr(vectors_param[first_vec_name], 'size', 'N/A')
+                       logging.debug(f"[{collection_name}] Vector size found in info.config.params.vectors (named)")
+
+        # 3. Log warning if still not found
+        if vec_size == "N/A":
+             logging.warning(f"[{collection_name}] Could not determine vector size from CollectionInfo. Checked info.vectors_config and info.config.params.vectors.")
+             # Log the structure for debugging if size wasn't found
+             if config_obj and hasattr(config_obj, 'params'):
+                  logging.debug(f"[{collection_name}] info.config.params structure: {getattr(config_obj.params, '__dict__', 'N/A')}")
+             elif vectors_config_obj:
+                  logging.debug(f"[{collection_name}] info.vectors_config structure: {getattr(vectors_config_obj, '__dict__', 'N/A')}")
+             else:
+                 logging.debug(f"[{collection_name}] Neither info.vectors_config nor info.config found or structured as expected.")
+
+
+        return {
+            "points_qdrantcount": points_count,
+            "vectors_count": vectors_count,
+            "vector_size": vec_size,
+            "status": str(status)
+        }
+    except Exception as e:
+        # Handle common errors gracefully
+        if "not found" in str(e).lower() or "status_code=404" in str(e):
+             logging.info(f"Qdrant collection '{collection_name}' not found.")
+        elif isinstance(e, AttributeError):
+             logging.warning(f"Attribute error getting Qdrant info for '{collection_name}': {e}. Structure might have changed.")
+        else:
+             logging.warning(f"Could not get Qdrant info for '{collection_name}': {type(e).__name__}: {e}")
+        return None
+
+# --- process_uploaded_data ---
 def process_uploaded_data(uploaded_file, gsheet_published_url, table_name, conn, llm_model, aux_models, qdrant_client, replace_confirmed=False):
     """
     Reads data, writes to SQLite (with confirmation), analyzes, embeds, indexes.
@@ -1183,31 +1323,6 @@ def get_sqlite_table_row_count(conn: sqlite3.Connection, table_name: str) -> int
         count = cursor.fetchone()[0]; cursor.close(); return count
     except Exception as e:
         logging.error(f"Error getting row count for table '{table_name}': {e}")
-        return None
-
-def get_qdrant_collection_info(qdrant_client: QdrantClient, collection_name: str) -> dict | None:
-    """Gets point count and vector dimension for a Qdrant collection."""
-    if not qdrant_client: return None
-    try:
-        info = qdrant_client.get_collection(collection_name=collection_name)
-        vec_config = info.vectors_config
-        vec_size = "N/A"
-        # Handle both single VectorParams and dict of NamedVectorParams
-        if isinstance(vec_config, models.VectorParams):
-             vec_size = vec_config.size
-        elif isinstance(vec_config, dict): # Assuming NamedVectorParams structure
-             # Get size of the first named vector found (or adjust if multiple needed)
-             first_vec_name = next(iter(vec_config), None)
-             if first_vec_name: vec_size = vec_config[first_vec_name].size
-
-        return {
-            "points_count": info.points_count,
-            "vectors_count": info.vectors_count,
-            "vector_size": vec_size,
-            "status": str(info.status)
-        }
-    except Exception as e:
-        logging.warning(f"Could not get Qdrant info for '{collection_name}': {e}")
         return None
 
 

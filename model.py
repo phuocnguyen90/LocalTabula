@@ -4,7 +4,7 @@ import dotenv
 import torch
 import logging
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-from fastembed import TextEmbedding
+from fast_embed import TextEmbedding
 from huggingface_hub import hf_hub_download
 
 try:
@@ -99,7 +99,7 @@ def load_aux_models():
                     sql_n_ctx = int(sql_n_ctx_str) if sql_n_ctx_str.isdigit() else 1024
 
                     logging.info(f"Loading SQL GGUF model using llama_cpp from: {local_sql_model_path}")
-                    logging.info(f"SQL GGUF Params: n_gpu_layers={sql_n_gpu_layers}, n_ctx={sql_n_ctx}")
+                    # logging.info(f"SQL GGUF Params: n_gpu_layers={sql_n_gpu_layers}, n_ctx={sql_n_ctx}")
 
                     sql_gguf_model = Llama(
                         model_path=local_sql_model_path, # Use the resolved path
@@ -121,12 +121,12 @@ def load_aux_models():
                       models_dict['sql_load_error'] = "Model path resolution failed"
 
 
-    # --- Load Embedding Model (FastEmbed - unchanged) ---
+    # --- Load Embedding Model ---
     try:
         logging.info("Loading Embedding model (sentence-transformers/paraphrase-multilingual-mpnet-base-v2)...")
         embedding_model_name = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
         # FastEmbed likely uses huggingface_hub internally too, respecting cache
-        embedding_model = TextEmbedding(model_name=embedding_model_name, cache_dir=cache_dir) # Pass cache_dir optionally
+        embedding_model = TextEmbedding.add_custom_model(model=embedding_model_name, model_file=cache_dir)
         models_dict['embedding_model'] = embedding_model
         embed_model_loaded = True
         logging.info("Embedding model loaded successfully.")

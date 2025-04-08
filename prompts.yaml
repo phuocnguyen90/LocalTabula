@@ -45,6 +45,9 @@ generate_sql_base: |
   2. Use correct numerical comparisons (e.g., `Count < 5`, not `Count < 5 units`).
   3. Handle extremes (min/max/top) by retrieving all ties (e.g., using subqueries like `WHERE col = (SELECT MAX(col) ...)` or `ORDER BY ... LIMIT 5` as fallback).
   4. Avoid unnecessary `ORDER BY` or `LIMIT` otherwise.
+  5. Avoid filtering out all rows unless explicitly requested. 
+  6. Avoid searching by exact match unless specified. Use `LIKE` or `ILIKE` for partial matches.
+  7. Do not make any changes to the database schema or data.
 
   User question: "{user_query}"
 

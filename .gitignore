@@ -176,6 +176,8 @@ test_utils.py
 test.py
 temp.py
 /unsloth_compiled_cache
+/test
+/app_data
 *.xlsx
 *.xls
 *.csv
