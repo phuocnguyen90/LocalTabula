@@ -10,6 +10,8 @@ import uuid
 import json
 import dotenv
 import numpy as np
+from typing import List, Dict, Any, Set, Tuple, Optional
+import re
 # --- NEW: Load environment variables from .env file ---
 from dotenv import load_dotenv
 import yaml # <-- NEW: Import YAML
@@ -242,191 +244,318 @@ def _suggest_semantic_columns(df_head: pd.DataFrame, schema: dict, table_name: s
     logging.info(f"Final semantic columns selected for embedding: {final_columns}")
     return final_columns
 
-def _embed_and_index_data(df: pd.DataFrame, table_name: str, semantic_columns: list, aux_models: dict, qdrant_client: QdrantClient):
+def prepare_collection(q_client: QdrantClient, collection_name: str, vector_size: int, table_name: str) -> tuple[bool, str, list[str]]:
     """
-    Embeds specified semantic columns and indexes them in Qdrant.
-    Uses UUIDs for Qdrant point IDs universally.
-    Stores original meaningful ID in payload.
-    Includes enhanced logging.
+    Checks if a Qdrant collection with the given name exists and deletes it if so,
+    then creates a new collection with the specified vector size.
+    
+    Returns:
+        (success: bool, error_message: str, status_messages: list[str])
     """
-    logging.info(f"Starting embedding and indexing process for table '{table_name}'...")
-
-    # --- Readiness Checks ---
-    if not qdrant_client:
-        logging.error(f"[{table_name}] Qdrant client not available. Aborting indexing.")
-        return False, "Qdrant client not initialized."
-    if not aux_models or aux_models.get('status') != 'loaded' or not aux_models.get('embedding_model'):
-        logging.error(f"[{table_name}] Embedding model not loaded or aux models failed. Aborting indexing.")
-        return False, "Embedding model not loaded or aux models failed."
-
-    embedding_model = aux_models.get('embedding_model')
-    if df.empty:
-        logging.info(f"[{table_name}] DataFrame is empty. Skipping embedding and collection creation.")
-        return True, "DataFrame is empty."
-    if not semantic_columns:
-        logging.warning(f"[{table_name}] No semantic columns specified. Skipping embedding and collection creation.")
-        return True, "No semantic columns specified."
-
-    valid_semantic_cols = [col for col in semantic_columns if col in df.columns]
-    logging.info(f"[{table_name}] Valid semantic columns found in DataFrame: {valid_semantic_cols}")
-    if not valid_semantic_cols:
-        logging.warning(f"[{table_name}] Valid semantic columns list is empty. Skipping embedding.")
-        return True, "Valid semantic columns list is empty."
-
-    logging.info(f"[{table_name}] Proceeding with embedding for columns: {valid_semantic_cols}")
-    collection_name = f"{QDRANT_COLLECTION_PREFIX}{table_name}"
     status_messages = []
-
-    # --- Universal UUID Strategy for Qdrant Point IDs ---
-    logging.info(f"[{table_name}] Using UUIDs for Qdrant point IDs.")
-
     try:
-        documents_to_embed = []
-        payloads = []
-        point_ids = [] # These will ALWAYS be UUIDs now
+        q_client.get_collection(collection_name=collection_name)
+        logging.warning(f"[{table_name}] Collection '{collection_name}' exists. Recreating it.")
+        q_client.delete_collection(collection_name=collection_name, timeout=10)
+        status_messages.append(f"Recreated collection '{collection_name}'.")
+        time.sleep(0.5)
+    except Exception:
+        logging.info(f"[{table_name}] Collection '{collection_name}' not found. Will create new.")
+    
+    try:
+        logging.info(f"[{table_name}] Creating collection '{collection_name}' with vector size {vector_size}...")
+        q_client.create_collection(
+            collection_name=collection_name,
+            vectors_config=models.VectorParams(size=vector_size, distance=models.Distance.COSINE)
+        )
+        logging.info(f"[{table_name}] Collection '{collection_name}' created successfully.")
+        status_messages.append(f"Created collection '{collection_name}'.")
+    except Exception as create_e:
+        logging.error(f"[{table_name}] Failed to create collection '{collection_name}': {create_e}", exc_info=True)
+        return False, f"Failed to create Qdrant collection: {create_e}", status_messages
 
-        potential_pk = None
-        if not df.columns.empty:
-             potential_pk = next((col for col in df.columns if col.lower() == 'id'),
-                                 df.columns[0] if df.columns[0].lower() in ['id', 'pk', 'key'] else None)
-        logging.info(f"[{table_name}] Potential primary key column identified: {potential_pk}")
+    return True, "", status_messages
 
-        logging.info(f"[{table_name}] Preparing documents for embedding from {len(df)} rows...")
-        rows_with_text = 0
-        for index, row in df.iterrows():
-            text_parts = [f"{col}: {row[col]}" for col in valid_semantic_cols if pd.notna(row[col]) and str(row[col]).strip()]
-            if not text_parts: continue
-            rows_with_text += 1
-            doc_text = " | ".join(text_parts)
+def prepare_documents(df: pd.DataFrame, valid_cols: list[str], table_name: str) -> tuple[list[str], list[dict], list[str]]:
+    """
+    Prepares a list of text documents, payloads, and unique point IDs for each row in the DataFrame.
+    Attempts to detect a primary key for better payload linkage.
+    
+    Returns:
+        documents_to_embed (list[str]), payloads (list[dict]), point_ids (list[str])
+    """
+    documents_to_embed = []
+    payloads = []
+    point_ids = []
 
-            payload = row.to_dict()
-            for k, v in payload.items():
-                 if pd.isna(v): payload[k] = None
-            payload["_table_name"] = table_name
-            payload["_source_text"] = doc_text
+    # Try to detect a primary key column (if it exists)
+    potential_pk = next((col for col in df.columns if col.lower() == 'id'), None)
+    if potential_pk is None and len(df.columns) > 0 and df.columns[0].lower() in ['id', 'pk', 'key']:
+        potential_pk = df.columns[0]
+    logging.info(f"[{table_name}] Potential primary key: {potential_pk}")
 
-            # --- Determine Original Meaningful ID (for payload) ---
-            original_id_value = f"{table_name}_idx_{index}" # Default
-            if potential_pk and potential_pk in row and pd.notna(row[potential_pk]):
-                try:
-                     pk_val_str = str(row[potential_pk])
-                     # Basic sanitization for common problematic chars if needed for display ID
-                     # pk_val_str_sanitized = pk_val_str.replace(" ", "_").replace("/", "-")
-                     original_id_value = f"{table_name}_{pk_val_str}"
-                except Exception as pk_str_err:
-                     logging.warning(f"[{table_name}] Could not convert PK '{row[potential_pk]}' to string for payload ID (Row {index}): {pk_str_err}. Using index fallback.")
-                     original_id_value = f"{table_name}_idx_{index}"
-            # --- Store Original ID in Payload ---
-            payload["_original_id"] = original_id_value
-            # --- End Original ID Logic ---
+    rows_with_text = 0
+    for index, row in df.iterrows():
+        # Concatenate the content of valid semantic columns
+        text_parts = [f"{col}: {row[col]}" for col in valid_cols 
+                      if pd.notna(row[col]) and str(row[col]).strip()]
+        if not text_parts:
+            continue
+        rows_with_text += 1
+        doc_text = " | ".join(text_parts)
+        
+        # Build payload from row data
+        payload = row.to_dict()
+        for k, v in payload.items():
+            if pd.isna(v):
+                payload[k] = None
+        payload["_table_name"] = table_name
+        payload["_source_text"] = doc_text
+        
+        # Determine an original ID value (using primary key if available)
+        original_id = f"{table_name}_idx_{index}"
+        if potential_pk and potential_pk in row and pd.notna(row[potential_pk]):
+            try:
+                original_id = f"{table_name}_{str(row[potential_pk])}"
+            except Exception as pk_err:
+                logging.warning(f"[{table_name}] Could not convert PK '{row[potential_pk]}' for row {index}: {pk_err}")
+        payload["_original_id"] = original_id
 
-            # --- Generate UUID for Qdrant Point ID ---
-            qdrant_point_id = str(uuid.uuid4())
-            # --- End Qdrant Point ID Logic ---
+        # Always generate a unique UUID for Qdrant point ID
+        unique_point_id = str(uuid.uuid4())
+        point_ids.append(unique_point_id)
+        payloads.append(payload)
+        documents_to_embed.append(doc_text)
+    
+    logging.info(f"[{table_name}] Prepared {len(documents_to_embed)} documents from {rows_with_text} rows with text.")
+    return documents_to_embed, payloads, point_ids
 
-            point_ids.append(qdrant_point_id) # Add the UUID to the list for Qdrant
-            payloads.append(payload)
-            documents_to_embed.append(doc_text)
+def compute_vector_size(embeddings: list, table_name: str) -> tuple[int, str]:
+    """
+    Determines the vector size from the embeddings.
+    Uses the environment variable EMBEDDING_VECTOR_SIZE as a reference and logs a warning if they differ.
+    
+    Returns:
+        (vector_size: int, error_message: str)
+    """
+    try:
+        computed_size = len(embeddings[0])
+        expected_size = int(os.getenv("EMBEDDING_VECTOR_SIZE", "768"))
+        if computed_size != expected_size:
+            logging.warning(f"[{table_name}] Computed vector size {computed_size} differs from EMBEDDING_VECTOR_SIZE {expected_size}. Using computed value.")
+            return computed_size, ""
+        return expected_size, ""
+    except Exception as e:
+        logging.error(f"[{table_name}] Error determining vector size: {e}", exc_info=True)
+        return 0, f"Error determining vector size: {e}"
 
-        logging.info(f"[{table_name}] Prepared {len(documents_to_embed)} documents from {rows_with_text} rows with text.")
-        if not documents_to_embed:
-            logging.warning(f"[{table_name}] No non-empty documents found to embed. Skipping embedding.")
-            return True, "No non-empty documents to embed."
-
-        # --- Get Embeddings ---
-        logging.info(f"[{table_name}] Generating {len(documents_to_embed)} embeddings...")
+def create_qdrant_collection_with_retry(q_client: QdrantClient, collection_name: str, vector_size: int, table_name: str,
+                                          retries: int = 3, delay: int = 2) -> tuple[bool, str, list[str]]:
+    """
+    Attempts to create (or recreate) a Qdrant collection.
+    Retries up to 'retries' times in case of transient network/DNS errors.
+    
+    Returns: (success, error_message, status_messages)
+    """
+    status_messages = []
+    for attempt in range(1, retries + 1):
         try:
-            embeddings_result = embedding_model.embed(documents_to_embed)
-            if not isinstance(embeddings_result, (list, np.ndarray)):
-                 embeddings = list(embeddings_result)
-                 logging.info(f"[{table_name}] Converted embedding result from {type(embeddings_result)} to list.")
-            else:
-                 embeddings = embeddings_result
+            # If the collection exists, delete it first.
+            try:
+                q_client.get_collection(collection_name=collection_name)
+                logging.warning(f"[{table_name}] Collection '{collection_name}' exists. Recreating.")
+                q_client.delete_collection(collection_name=collection_name, timeout=10)
+                status_messages.append(f"Recreated collection '{collection_name}'.")
+                time.sleep(0.5)
+            except Exception:
+                logging.info(f"[{table_name}] Collection '{collection_name}' not found. Proceeding to create a new one.")
 
-            embedding_count = len(embeddings) if embeddings is not None else 0
-            logging.info(f"[{table_name}] Embedding generation completed. Received {embedding_count} embeddings.")
-            if not embeddings or embedding_count != len(documents_to_embed):
-                 logging.error(f"[{table_name}] Embedding failed or returned incorrect count ({embedding_count} vs {len(documents_to_embed)}). Aborting.")
-                 return False, "Embedding failed or returned incorrect number of vectors."
-        except Exception as embed_e:
-            logging.error(f"[{table_name}] Error during embedding call: {embed_e}", exc_info=True)
-            return False, f"Embedding generation failed: {embed_e}"
-
-        # --- Get Vector Size ---
-        try:
-            vector_size = len(embeddings[0])
-            logging.info(f"[{table_name}] Determined vector size: {vector_size}")
-        except IndexError:
-             logging.error(f"[{table_name}] Failed to get vector size from empty embeddings list. Aborting.")
-             return False, "Failed to get vector size from embeddings."
-        except Exception as size_e:
-             logging.error(f"[{table_name}] Error determining vector size: {size_e}", exc_info=True)
-             return False, f"Error determining vector size: {size_e}"
-
-        # --- Collection Handling ---
-        logging.info(f"[{table_name}] Checking/Creating Qdrant collection '{collection_name}'...")
-        try:
-            qdrant_client.get_collection(collection_name=collection_name)
-            logging.warning(f"[{table_name}] Collection '{collection_name}' exists. Recreating.")
-            qdrant_client.delete_collection(collection_name=collection_name, timeout=10)
-            status_messages.append(f"Recreated collection '{collection_name}'.")
-            time.sleep(0.5)
-        except Exception:
-             logging.info(f"[{table_name}] Collection '{collection_name}' not found. Will create new.")
-
-        try:
-            logging.info(f"[{table_name}] Attempting creation of '{collection_name}' size {vector_size}...")
-            qdrant_client.create_collection(
+            logging.info(f"[{table_name}] Attempt {attempt}: Creating collection '{collection_name}' with vector size {vector_size}...")
+            q_client.create_collection(
                 collection_name=collection_name,
                 vectors_config=models.VectorParams(size=vector_size, distance=models.Distance.COSINE)
             )
-            logging.info(f"[{table_name}] Successfully created/ensured collection '{collection_name}'.")
+            logging.info(f"[{table_name}] Collection '{collection_name}' created successfully.")
             status_messages.append(f"Created collection '{collection_name}'.")
-        except Exception as create_e:
-             logging.error(f"[{table_name}] Failed to create Qdrant collection '{collection_name}': {create_e}", exc_info=True)
-             return False, f"Failed to create Qdrant collection: {create_e}"
+            return True, "", status_messages
+        except Exception as e:
+            logging.error(f"[{table_name}] Attempt {attempt} failed to create collection '{collection_name}': {e}", exc_info=True)
+            if attempt < retries:
+                time.sleep(delay)
+            else:
+                return False, f"Failed to create Qdrant collection after {retries} attempts: {e}", status_messages
+    return False, "Unexpected error in collection creation", status_messages
 
-        # --- Upsert data ---
-        batch_size = 100
-        num_batches = (len(point_ids) + batch_size - 1) // batch_size
-        logging.info(f"[{table_name}] Upserting {len(point_ids)} points to Qdrant in {num_batches} batches...")
-        for i in range(num_batches):
-            start_idx = i * batch_size
-            end_idx = min((i + 1) * batch_size, len(point_ids))
-            batch_ids = point_ids[start_idx:end_idx] # Use UUIDs here
-            batch_vectors = [list(map(float, vec)) for vec in embeddings[start_idx:end_idx]]
-            batch_payloads = payloads[start_idx:end_idx]
-
-            logging.debug(f"[{table_name}] Upserting batch {i+1}/{num_batches} (size {len(batch_ids)})")
-            try:
-                qdrant_client.upsert(
-                    collection_name=collection_name,
-                    points=models.Batch(
-                        ids=batch_ids, # These are now UUIDs
-                        vectors=batch_vectors,
-                        payloads=batch_payloads
-                    ),
-                    wait=True
-                )
-            except Exception as upsert_e:
-                 logging.error(f"[{table_name}] Error upserting batch {i+1} to Qdrant: {upsert_e}", exc_info=True)
-                 return False, f"Error during Qdrant upsert: {upsert_e}"
-
-        logging.info(f"[{table_name}] Qdrant upsert complete.")
-        status_messages.append(f"Indexed {len(point_ids)} points.")
-        return True, "\n".join(status_messages)
-
+def compute_vector_size(embeddings: list, table_name: str) -> tuple[int, str]:
+    try:
+        computed_size = len(embeddings[0])
+        expected_size = int(os.getenv("EMBEDDING_VECTOR_SIZE", "768"))
+        if computed_size != expected_size:
+            logging.warning(f"[{table_name}] Computed vector size {computed_size} differs from EMBEDDING_VECTOR_SIZE {expected_size}. Using computed value.")
+            return computed_size, ""
+        return expected_size, ""
     except Exception as e:
-        logging.error(f"[{table_name}] Unexpected error during embedding/indexing: {e}", exc_info=True)
-        return False, f"Unexpected error during indexing: {e}"
+        logging.error(f"[{table_name}] Error determining vector size: {e}", exc_info=True)
+        return 0, f"Error determining vector size: {e}"
 
+def prepare_documents(df: pd.DataFrame, valid_cols: list[str], table_name: str) -> tuple[list[str], list[dict], list[str]]:
+    """Prepare text documents, payloads, and UUID point IDs from the DataFrame using the valid semantic columns."""
+    documents, payloads, point_ids = [], [], []
 
-# --- utils.py ---
-# utils.py
+    # Attempt to find a primary key column for more meaningful payload IDs
+    potential_pk = next((col for col in df.columns if col.lower() == 'id'), None)
+    if potential_pk is None and len(df.columns) > 0 and df.columns[0].lower() in ['id', 'pk', 'key']:
+        potential_pk = df.columns[0]
+    logging.info(f"[{table_name}] Potential primary key: {potential_pk}")
 
-from qdrant_client import QdrantClient, models # Ensure models is imported
+    for idx, row in df.iterrows():
+        parts = [f"{col}: {row[col]}" for col in valid_cols if pd.notna(row[col]) and str(row[col]).strip()]
+        if not parts:
+            continue
+        doc_text = " | ".join(parts)
+        documents.append(doc_text)
+        payload = row.to_dict()
+        for k, v in payload.items():
+            if pd.isna(v):
+                payload[k] = None
+        payload["_table_name"] = table_name
 
-# ... other code ...
+        # Create an original ID using the primary key if possible
+        original_id = f"{table_name}_idx_{idx}"
+        if potential_pk and potential_pk in row and pd.notna(row[potential_pk]):
+            try:
+                original_id = f"{table_name}_{str(row[potential_pk])}"
+            except Exception as ex:
+                logging.warning(f"[{table_name}] Error converting PK for row {idx}: {ex}")
+        payload["_original_id"] = original_id
+        payload["_source_text"] = doc_text
+
+        # Use a UUID for the Qdrant point ID
+        point_ids.append(str(uuid.uuid4()))
+        payloads.append(payload)
+
+    logging.info(f"[{table_name}] Prepared {len(documents)} documents.")
+    return documents, payloads, point_ids
+
+def create_or_update_collection(q_client: QdrantClient, collection_name: str, vector_size: int, table_name: str) -> tuple[bool, str, list[str]]:
+    """
+    Uses a fixed collection name. If the collection exists, delete it and re-create it.
+    Returns (success, error_message, status_messages).
+    """
+    status_messages = []
+    try:
+        # Check if collection exists
+        q_client.get_collection(collection_name=collection_name)
+        logging.info(f"[{table_name}] Collection '{collection_name}' exists. Deleting to update.")
+        q_client.delete_collection(collection_name=collection_name, timeout=10)
+        status_messages.append(f"Deleted existing collection '{collection_name}'.")
+        time.sleep(0.5)
+    except Exception:
+        logging.info(f"[{table_name}] No existing collection '{collection_name}'.")
+    
+    try:
+        logging.info(f"[{table_name}] Creating collection '{collection_name}' with vector size {vector_size}...")
+        q_client.create_collection(
+            collection_name=collection_name,
+            vectors_config=models.VectorParams(size=vector_size, distance=models.Distance.COSINE)
+        )
+        logging.info(f"[{table_name}] Collection '{collection_name}' created successfully.")
+        status_messages.append(f"Created collection '{collection_name}'.")
+    except Exception as e:
+        logging.error(f"[{table_name}] Failed to create collection '{collection_name}': {e}", exc_info=True)
+        return False, f"Failed to create Qdrant collection: {e}", status_messages
+    return True, "", status_messages
+
+def _embed_and_index_data(df: pd.DataFrame, table_name: str, semantic_columns: list, aux_models: dict,
+                          qdrant_client: QdrantClient) -> tuple[bool, str]:
+    """
+    Embeds specified semantic columns and indexes them in the Qdrant collection associated
+    with the SQLite table. Uses a fixed collection name (table_data_{table_name}).
+    """
+    logging.info(f"Starting embedding and indexing for table '{table_name}'...")
+    
+    # --- Readiness Checks ---
+    if not qdrant_client:
+        logging.error(f"[{table_name}] Qdrant client not available.")
+        return False, "Qdrant client not initialized."
+    if not aux_models or aux_models.get('status') != 'loaded' or not aux_models.get('embedding_model'):
+        logging.error(f"[{table_name}] Embedding model or aux models not loaded.")
+        return False, "Embedding model not loaded or aux models failed."
+    if df.empty:
+        logging.info(f"[{table_name}] DataFrame is empty; skipping embedding.")
+        return True, "DataFrame is empty."
+    if not semantic_columns:
+        logging.warning(f"[{table_name}] No semantic columns specified.")
+        return True, "No semantic columns specified."
+    
+    valid_cols = [col for col in semantic_columns if col in df.columns]
+    logging.info(f"[{table_name}] Valid semantic columns: {valid_cols}")
+    if not valid_cols:
+        logging.warning(f"[{table_name}] No valid semantic columns found.")
+        return True, "Valid semantic columns list is empty."
+    
+    # --- Prepare Documents ---
+    documents, payloads, point_ids = prepare_documents(df, valid_cols, table_name)
+    if not documents:
+        logging.warning(f"[{table_name}] No non-empty documents prepared for embedding.")
+        return True, "No non-empty documents to embed."
+    
+    # --- Generate Embeddings ---
+    embedding_model = aux_models.get("embedding_model")
+    logging.info(f"[{table_name}] Generating embeddings for {len(documents)} documents...")
+    try:
+        embeddings_result = embedding_model.embed(documents)
+        embeddings = list(embeddings_result) if not isinstance(embeddings_result, (list, np.ndarray)) else embeddings_result
+        if len(embeddings) != len(documents):
+            logging.error(f"[{table_name}] Embedding count ({len(embeddings)}) does not match document count ({len(documents)}).")
+            return False, "Embedding count mismatch."
+    except Exception as embed_e:
+        logging.error(f"[{table_name}] Error generating embeddings: {embed_e}", exc_info=True)
+        return False, f"Embedding generation failed: {embed_e}"
+    
+    # --- Compute Vector Size ---
+    vector_size, size_error = compute_vector_size(embeddings, table_name)
+    if vector_size == 0:
+        return False, size_error
+    logging.info(f"[{table_name}] Using vector size: {vector_size}")
+    
+    # --- Fixed Collection Name ---
+    collection_name = f"{QDRANT_COLLECTION_PREFIX}{table_name}"
+    logging.info(f"[{table_name}] Using fixed collection name: '{collection_name}'")
+    
+    # --- Create or Update Collection ---
+    coll_ok, coll_error, coll_status = create_or_update_collection(qdrant_client, collection_name, vector_size, table_name)
+    if not coll_ok:
+        return False, coll_error
+    
+    # --- Upsert Data in Batches ---
+    batch_size = 100
+    num_batches = (len(point_ids) + batch_size - 1) // batch_size
+    logging.info(f"[{table_name}] Upserting {len(point_ids)} points into '{collection_name}' in {num_batches} batches...")
+    for i in range(num_batches):
+        start_idx = i * batch_size
+        end_idx = min((i + 1) * batch_size, len(point_ids))
+        batch_ids = point_ids[start_idx:end_idx]
+        batch_vectors = [list(map(float, vec)) for vec in embeddings[start_idx:end_idx]]
+        batch_payloads = payloads[start_idx:end_idx]
+        
+        logging.debug(f"[{table_name}] Upserting batch {i+1}/{num_batches} with {len(batch_ids)} points.")
+        try:
+            qdrant_client.upsert(
+                collection_name=collection_name,
+                points=models.Batch(
+                    ids=batch_ids,
+                    vectors=batch_vectors,
+                    payloads=batch_payloads
+                ),
+                wait=True
+            )
+        except Exception as upsert_e:
+            logging.error(f"[{table_name}] Error upserting batch {i+1}: {upsert_e}", exc_info=True)
+            return False, f"Error during Qdrant upsert: {upsert_e}"
+    
+    logging.info(f"[{table_name}] Successfully indexed {len(point_ids)} points into collection '{collection_name}'.")
+    return True, f"Indexed {len(point_ids)} points into collection '{collection_name}'."
 
 def get_qdrant_collection_info(qdrant_client: QdrantClient, collection_name: str) -> dict | None:
     """Gets point count and vector dimension for a Qdrant collection."""
@@ -655,20 +784,69 @@ def get_db_connection(db_path):
         print(f"ERROR: Failed to connect to DB at {db_path}: {e}")
         return None
 
-# --- Qdrant Client Initialization ---
 @st.cache_resource
-def init_qdrant_client():
-    """Initializes and caches an in-memory Qdrant client."""
-    print("Initializing in-memory Qdrant client...")
-    try:
-        client = QdrantClient(":memory:")
-        print("Qdrant client initialized.")
-        return client
-    except Exception as e:
-        print(f"FATAL QDRANT ERROR: {e}")
-        return None
+# utils.py
 
-# --- REMOVED load_models (replaced by get_cached_aux_models) ---
+@st.cache_resource # Keep caching
+def init_qdrant_client():
+    """
+    Initializes and caches a Qdrant client.
+    Tries persistent local file, falls back to in-memory.
+    """
+    persistent_path_dir = None
+    qdrant_filename = "qdrant_storage" # Changed filename slightly
+
+    # Use the app_data directory determined by setup_environment
+    # We need setup_environment to run first, which happens in app.py
+    # Let's try to determine the path similarly here, or ideally pass it
+    dev_mode_str = os.getenv('DEVELOPMENT_MODE', 'false').lower()
+    is_dev_mode = dev_mode_str in ('true', '1', 't', 'yes', 'y')
+    if is_dev_mode:
+        home_dir = os.path.expanduser("~")
+        app_data_dir = os.path.join(home_dir, ".streamlit_chat_dev_data")
+    else:
+        current_working_dir = os.getcwd()
+        app_data_dir = os.path.join(current_working_dir, "app_data")
+
+    # Ensure directory exists
+    try:
+        os.makedirs(app_data_dir, exist_ok=True)
+        persistent_path_dir = os.path.join(app_data_dir, qdrant_filename)
+        logging.info(f"Checking for persistent Qdrant storage at: {persistent_path_dir}")
+    except OSError as e:
+        logging.warning(f"Could not create/access Qdrant storage directory '{app_data_dir}': {e}. Will use in-memory.")
+        persistent_path_dir = None
+
+    client = None
+    # Try persistent path only if directory seems accessible
+    if persistent_path_dir:
+        try:
+            logging.info(f"Attempting persistent Qdrant client initialization at: {persistent_path_dir}")
+            # Explicitly use path, avoid default URL connection attempts
+            client = QdrantClient(path=persistent_path_dir)
+            # Perform a basic operation to confirm connectivity/usability
+            client.get_collections() # Check if basic interaction works
+            logging.info(f"Persistent Qdrant client initialized successfully at {persistent_path_dir}")
+            return client
+        except Exception as e:
+            # Catching broader exceptions as specific http errors might not cover all init issues
+            logging.error(f"Persistent Qdrant client initialization failed at {persistent_path_dir}: {type(e).__name__} - {e}")
+            logging.warning("Falling back to in-memory Qdrant client.")
+            client = None # Ensure client is None for fallback
+
+    # Fallback to in-memory if persistent path wasn't attempted or failed
+    if client is None:
+        try:
+            logging.info("Initializing in-memory Qdrant client...")
+            client = QdrantClient(":memory:")
+            # Basic check for in-memory
+            client.get_collections()
+            logging.info("In-memory Qdrant client initialized successfully.")
+            return client
+        except Exception as e:
+            logging.fatal(f"FATAL: Failed to initialize even in-memory Qdrant client: {e}", exc_info=True)
+            return None # Indicate total failure
+
 
 # --- Data Processing Functions ---
 
@@ -694,56 +872,18 @@ def get_schema_info(conn):
 # --- REMOVED _analyze_columns_for_embedding placeholder ---
 
 
-# --- Query Processing Functions ---
-
-def _route_query(user_query: str, schema: dict, llm_wrapper: LLMWrapper, sample_data_str: str | None = None) -> str:
+def _generate_sql_query(
+    refined_query_input: str, # Renamed for clarity - this IS the refined query
+    schema: dict,
+    sample_data_str: Optional[str],
+    aux_models,
+    augmented_keywords: Optional[list[str]] = None, # Accept augmented keywords
+    previous_sql: str | None = None,
+    feedback: str | None = None
+) -> str:
     """
-    Determines query route ('SQL' or 'SEMANTIC') using LLM structured output if available,
-    otherwise falls back to keywords. Uses prompt from PROMPTS.
-    """
-    default_route = "SQL"
-    logging.info("Routing query...")
-
-    if not llm_wrapper or not llm_wrapper.is_ready or llm_wrapper.mode != 'openrouter':
-        logging.warning(f"LLM wrapper not ready or not in OpenRouter mode ({getattr(llm_wrapper, 'mode', 'N/A')}). Falling back to keyword routing.")
-        query_lower = user_query.lower()
-        sql_kws = ["how many", "list", "total", "average", "maximum", "minimum", "count", "sum", "max", "min", "avg", "group by", "order by", " where ", " id ", " date ", " year ", " month ", " price", " number of ", " value of "]
-        sem_kws = ["describe", "description", "details about", "similar to", "meaning", "related to", "find products like", "tell me about", "explain"]
-        if any(kw in query_lower for kw in sem_kws): return "SEMANTIC"
-        if any(kw in query_lower for kw in sql_kws): return "SQL"
-        logging.info(f"Keyword fallback ambiguous. Defaulting to: {default_route}")
-        return default_route
-
-    logging.info("Attempting routing via OpenRouter structured output...")
-    # --- Use loaded prompt ---
-    sample_context_for_prompt = f"\nSample Data:\n{sample_data_str}\n" if sample_data_str else ""
-    prompt = PROMPTS['route_query_structured'].format(
-        schema=schema,
-        user_query=user_query,
-        sample_data_context=sample_context_for_prompt # Pass sample data here
-    )
-    # --- End Use loaded prompt ---
-    logging.debug(f"Sending structured routing prompt to LLM:\n{prompt}")
-
-    structured_result = llm_wrapper.generate_structured_response(prompt)
-
-    if structured_result and isinstance(structured_result, dict):
-        query_type = structured_result.get("query_type")
-        if query_type in ["SQL", "SEMANTIC"]:
-            logging.info(f"Structured routing successful. Determined type: {query_type}")
-            return query_type
-        else:
-            logging.warning(f"LLM returned valid JSON but with unexpected 'query_type' value: '{query_type}'. Falling back.")
-    else:
-        logging.warning(f"LLM structured response failed or returned invalid result: {structured_result}. Falling back.")
-
-    logging.info(f"Structured routing failed. Defaulting route to: {default_route}")
-    return default_route
-
-
-def _generate_sql_query(user_query: str, schema: dict, sample_data_str: str | None, aux_models, previous_sql: str | None = None, feedback: str | None = None) -> str:
-    """
-    Generates SQL query, incorporating feedback from previous attempts if provided.
+    Generates SQL query using the refined query and schema context.
+    Optionally incorporates augmented keywords if the prompt template supports it.
     Loads prompt components from PROMPTS.
     """
     sql_llm: Llama = aux_models.get('sql_gguf_model')
@@ -751,32 +891,24 @@ def _generate_sql_query(user_query: str, schema: dict, sample_data_str: str | No
         return "-- Error: SQL GGUF model object missing."
 
     sample_context = f"Data Sample (representative table):\n{sample_data_str}\n" if sample_data_str else "Sample data not available.\n"
-
+    prompt_context = {
+        "schema": json.dumps(schema, indent=2), # Format schema as JSON string
+        "sample_context": sample_context,
+        "user_query": refined_query_input, # Use the refined query received as input
+        "augmented_keywords": augmented_keywords if augmented_keywords else []
+    }
     # --- Construct Prompt using loaded components ---
     prompt_parts = [
-        PROMPTS['generate_sql_base'].format(
-            schema=schema,
-            sample_context=sample_context,
-            user_query=user_query
-        )
+        PROMPTS['generate_sql_base'].format(**prompt_context) # Use prepared context
     ]
+
 
     if previous_sql and feedback:
         if "syntax error" in feedback.lower():
-            prompt_parts.append(
-                PROMPTS['generate_sql_feedback_syntax'].format(
-                    previous_sql=previous_sql,
-                    feedback=feedback
-                )
-            )
+            prompt_parts.append(PROMPTS['generate_sql_feedback_syntax'].format(previous_sql=previous_sql, feedback=feedback))
         else:
-            prompt_parts.append(
-                PROMPTS['generate_sql_feedback_other'].format(
-                    previous_sql=previous_sql,
-                    feedback=feedback
-                )
-            )
-
+            prompt_parts.append(PROMPTS['generate_sql_feedback_other'].format(previous_sql=previous_sql, feedback=feedback))
+            
     prompt_parts.append(PROMPTS['generate_sql_response_format'])
     prompt = "\n".join(prompt_parts)
     # --- End Prompt Construction ---
@@ -961,12 +1093,13 @@ def _ensure_english_query(user_query: str, llm_wrapper: LLMWrapper) -> tuple[str
 # --- REMOVED route_query_wrapper - logic integrated into _route_query ---
 
 def execute_sql_pipeline(
-    english_query: str,
-    schema: dict, # Should be filtered schema for the selected table
+    refined_query: str,
+    schema: dict,
     sample_data_str:str,
     aux_models,
     conn,
     llm_wrapper,
+    augmented_keywords: Optional[list[str]] = None, # Add parameter
     max_retries: int = 1
 ) -> dict:
     """
@@ -987,10 +1120,11 @@ def execute_sql_pipeline(
         logging.info(f"SQL Generation/Execution Attempt #{attempt + 1}")
         # Ensure schema and sample are for the relevant table only
         current_sql = _generate_sql_query(
-            user_query=english_query, # Use the refined query
-            schema=schema,           # Pass the filtered schema
-            sample_data_str=sample_data_str, # Pass relevant sample
+            refined_query_input=refined_query, 
+            schema=schema,         
+            sample_data_str=sample_data_str, 
             aux_models=aux_models,
+            augmented_keywords=augmented_keywords, 
             previous_sql=current_sql,
             feedback=previous_feedback
         )
@@ -1011,7 +1145,7 @@ def execute_sql_pipeline(
 
         # Validate results using the original query intent (or refined query?)
         # Using refined query for validation might be more precise
-        is_valid, validation_feedback = _validate_sql_results(english_query, current_sql, sql_df, llm_wrapper)
+        is_valid, validation_feedback = _validate_sql_results(refined_query, current_sql, sql_df, llm_wrapper)
         if is_valid:
             sql_result["sql_success"] = True; sql_result["sql_data"] = sql_df
             logging.info("SQL attempt successful and validated.")
@@ -1140,99 +1274,210 @@ def generate_final_summary(
 
 
 def process_natural_language_query(
-    original_query: str, conn, schema: dict, llm_wrapper, aux_models, qdrant_client, max_retries: int = 1
+    original_query: str, 
+    conn: Optional[sqlite3.Connection], 
+    schema: dict, # This is now expected to be the FULL schema dict {db_id: {table: [cols]}}
+    llm_wrapper, aux_models, qdrant_client, max_retries: int = 1,
+    conversation_history: Optional[list] = None,
+    pre_selected_db_id: Optional[str] = None # From previous refactor
 ) -> dict:
     """
-    Main pipeline Refactored:
-    1. Validate inputs. Check English.
-    2. Consolidate refinement, table selection, routing via LLM (refine_and_select).
-    3. Retrieve sample data for the selected table.
-    4. Execute primary pipeline (SQL or semantic) using refined query and filtered context.
-    5. Optionally run secondary route if primary failed.
-    6. Generate a final natural language summary.
-    Returns a result dictionary with relevant data.
+    Main pipeline (Two-Stage Analysis & Generation, Optional Execution):
+    1. Validate inputs. Check language.
+    2. Stage 1: Select relevant db_id.
+    3. Stage 2: Refine query, get keywords, determine route.
+    4. If route is SQL, generate SQL string.
+    5. If conn is provided, proceed with execution, secondary route, and summary.
+    6. Returns analysis results (incl. generated SQL) and optionally execution results.
     """
     # Initial validation
-    result = validate_inputs(original_query, conn, schema, llm_wrapper, qdrant_client)
-    if result.get("status") == "error": return result
+    if not llm_wrapper or not llm_wrapper.is_ready: return {"status": "error", "message": "LLM wrapper not ready."}
+    if not aux_models or aux_models.get('status') != 'loaded': return {"status": "error", "message": "Auxiliary models not ready."}
+    if not qdrant_client: logging.warning("Qdrant client not ready, semantic search may fail."); # Non-fatal for SQL focus
+    if not schema: return {"status": "error", "message": "Full schema dictionary not provided."}
 
-    # Check/Translate Query Language (do this early)
+    result = { # Initialize result dict
+        "status": "processing", "generated_sql": None, "selected_db_id": None,
+        "determined_route": None, "refined_query": None, "augmented_keywords": [],
+        "sql_data": None, "sql_error": None, "semantic_data": None,
+        "semantic_error": None, "natural_language_summary": None, "raw_display_data": None
+    }
+
+
+    # Check/Translate Query Language early on
     processed_query, was_translated = _ensure_english_query(original_query, llm_wrapper)
     result["query_was_translated"] = was_translated
-    result["processed_query"] = processed_query # Store the query used for processing
+    result["processed_query"] = processed_query  # Store the query used for processing
+    
+    # Ensure that schema is up-to-date: if it's empty, refresh it from the DB.
+    if not schema:
+        schema = get_schema_info(conn)
+        if not schema:
+            return {"status": "error", "message": "No tables found in the database."}
 
-    # Use conversation history
-    conversation_history = st.session_state.get("messages", [])
+    current_conversation_history = conversation_history if conversation_history is not None else [] # Assuming streamlit context
+    selected_db_id = None
+    formatted_context_for_selection = "{}" # Default empty
+    schemas_truncated = False
+    # --- Stage 1: Select Database ID ---
+    logging.info("Stage 1: Selecting Database ID...")
+    if pre_selected_db_id and pre_selected_db_id in schema:
+        selected_db_id = pre_selected_db_id
+    else:
+        logging.info("Stage 1: Selecting Database ID...")
+        temp_schemas_for_prompt, schemas_truncated = format_schemas_for_prompt(schema) # Use schema-only formatter
 
-    # --- Consolidate refinement, table selection, routing ---
-    refinement_data = refine_and_select(processed_query, conversation_history, schema, llm_wrapper)
-    refined_query = refinement_data.get("refined_query", processed_query) # Fallback to processed query
-    selected_table = refinement_data.get("selected_table")
-    recommended_route = refinement_data.get("route", "SQL").upper() # Default to SQL
+        selected_db_id = select_database_id(
+            processed_query,
+            temp_schemas_for_prompt, # Pass formatted schemas string
+            schemas_truncated,
+            list(schema.keys()), # Pass original keys for validation
+            llm_wrapper,
+            current_conversation_history
+        )
 
-    # Validate selected table
-    if not selected_table or selected_table not in schema:
-        logging.warning(f"LLM selected invalid table '{selected_table}'. Falling back.")
-        # Fallback logic (e.g., first table or simple keyword match)
-        selected_table = next(iter(schema), None) # Just take the first table
-        if not selected_table: return {"status": "error", "message": "No tables found after LLM fallback."}
-        # Optionally, re-route based on fallback table? For now, keep original route.
+    
+    if not selected_db_id or selected_db_id not in schema:
+        msg = f"Could not determine relevant database ID (Selected: {selected_db_id})."
+        logging.error(msg + " Cannot proceed.")
+        result.update({"status": "error", "message": msg})
+        return result
+
+    logging.info(f"Stage 1 Result: Selected DB ID = {selected_db_id}")
+    result["selected_db_id"] = selected_db_id
+    selected_db_schema_tables = schema[selected_db_id] # Get tables for the selected DB
+
+    # --- Stage 1.5: Get Sample Data for the SELECTED DB ---
+    # This requires a connection. If conn is None (like in benchmark first pass),
+    # sample_data will be None, and subsequent stages must handle it.
+    sample_data_str_selected = None
+    if conn:
+        first_table_in_selected_db = next(iter(selected_db_schema_tables), None)
+        if first_table_in_selected_db:
+            sample_data_str_selected = get_table_sample_data(conn, first_table_in_selected_db, limit=3)
+
+
+    # --- Stage 2: Refine Query and Determine Route ---
+    logging.info("Stage 2: Refining Query and Determining Route...")
+    refinement_data = refine_and_select(
+        processed_query, 
+        current_conversation_history,
+        {selected_db_id: selected_db_schema_tables},        
+        sample_data=sample_data_str_selected,        
+        llm_wrapper=llm_wrapper,
+    )
+
+    refined_query = refinement_data.get("refined_query", processed_query)
+    recommended_route = refinement_data.get("route", "SQL").upper()
+    augmented_keywords = refinement_data.get("augmented_keywords", [])
 
     result["refined_query"] = refined_query
-    result["selected_table"] = selected_table
     result["determined_route"] = recommended_route
-    logging.info(f"Refined Query: {refined_query}")
-    logging.info(f"Selected Table: {selected_table}")
-    logging.info(f"Recommended Route: {recommended_route}")
+    result["augmented_keywords"] = augmented_keywords
+    logging.info(f"Stage 2 Result: Refined Query='{refined_query}', Route='{recommended_route}', Keywords={augmented_keywords}")
 
-    # --- Prepare context for the selected table ---
-    filtered_schema = {selected_table: schema[selected_table]}
-    sample_data_str = get_table_sample_data(conn, selected_table, limit=3)
-
-    # --- Execute Primary Pipeline ---
-    sql_result = {"sql_success": False} # Initialize placeholders
-    semantic_result = {"semantic_success": False}
-
+    # --- Stage 3: Generate SQL (if route is SQL) ---
     if recommended_route == "SQL":
-        sql_result = execute_sql_pipeline(
-            refined_query, filtered_schema, sample_data_str, aux_models, conn, llm_wrapper, max_retries
+        logging.info("Stage 3: Generating SQL Query...")
+        # Pass None for sample_data_str initially, execution part will get it if needed
+        generated_sql_string = _generate_sql_query(
+            refined_query_input=refined_query,
+            schema=selected_db_schema_tables,
+            sample_data_str=sample_data_str_selected, 
+            aux_models=aux_models,
+            augmented_keywords=augmented_keywords
         )
+        result["generated_sql"] = generated_sql_string # Store generated SQL or error string
+
+        if generated_sql_string.startswith("-- Error"):
+             result["status"] = "error_sql_generation"
+             result["message"] = f"SQL Generation Failed: {generated_sql_string}"
+             logging.error(f"SQL Generation Failed: {generated_sql_string}")
+             # Return now, cannot execute
+             return result
+        else:
+             result["status"] = "analysis_complete_sql_generated"
+             result["message"] = "Analysis & SQL Generation complete. Execution pending."
+             logging.info("SQL Generation Successful.")
+
     elif recommended_route == "SEMANTIC":
-        semantic_result = execute_semantic_pipeline(
-            refined_query, filtered_schema, aux_models, qdrant_client
-        )
+        result["status"] = "analysis_complete_semantic_route"
+        result["message"] = "Analysis complete, SEMANTIC route determined."
+        logging.info("Semantic route determined.")
+        # Return now, benchmark doesn't focus on semantic execution (for now)
+        return result
     else:
-        return {"status": "error", "message": f"Internal Error: Unknown route '{recommended_route}' determined."}
+        result["status"] = "error_unknown_route"
+        result["message"] = f"Analysis failed: Unknown route '{recommended_route}'."
+        logging.error(f"Unknown route '{recommended_route}'.")
+        return result
 
-    # --- Optionally Run Secondary Route ---
-    # Pass the filtered context (schema, sample) for the *selected table* to the secondary route as well
-    sql_result, semantic_result = run_secondary_route(
-        refined_query, recommended_route, sql_result, semantic_result, aux_models, conn,
-        filtered_schema, llm_wrapper, qdrant_client, sample_data_str
-    )
+    # --- Stage 4: Execute SQL, Run Secondary, Summarize (Requires Connection) ---
+    if conn is not None:
+        logging.info("Stage 4: Executing SQL and Summarizing (Connection provided)...")
+        sql_result = {"sql_success": False}
+        semantic_result = {"semantic_success": False} # Needed for secondary route logic
 
-    # --- Aggregate Results ---
-    result["generated_sql"] = sql_result.get("generated_sql")
-    result["sql_data"] = sql_result.get("sql_data")
-    result["sql_error"] = sql_result.get("sql_error")
-    result["semantic_data"] = semantic_result.get("semantic_data")
-    result["semantic_error"] = semantic_result.get("semantic_error")
+        if recommended_route == "SQL" and not result["generated_sql"].startswith("-- Error"):
+            
+            sql_result = execute_sql_pipeline(
+                refined_query=refined_query,
+                schema=selected_db_schema_tables,
+                sample_data_str=sample_data_str_selected, # Now we have sample data
+                aux_models=aux_models,
+                conn=conn, # Pass the actual connection
+                llm_wrapper=llm_wrapper,
+                augmented_keywords=augmented_keywords,
+                max_retries=max_retries
+            )
+            # Update result dict with execution outcome
+            result["generated_sql"] = sql_result.get("generated_sql", result["generated_sql"]) # Keep generated SQL
+            result["sql_data"] = sql_result.get("sql_data")
+            result["sql_error"] = sql_result.get("sql_error")
+            if not sql_result.get("sql_success"):
+                result["status"] = "error_sql_execution"
+                result["message"] = f"SQL Execution Failed: {sql_result.get('sql_error')}"
+            # else: Status remains related to match/summary below
 
-    # --- Generate Final Summary ---
-    nl_summary = generate_final_summary(
-        original_query,
-        refined_query, # Use the refined query for context in the summary prompt
-        was_translated,
-        result.get("sql_data"),
-        result.get("semantic_data"),
-        llm_wrapper
-    )
-    result["natural_language_summary"] = nl_summary
-    result["message"] = nl_summary # Main message for display
-    result["status"] = "success" # Assuming summary generation is always 'successful' in structure
-    # Data for potential detailed display (DataFrames, semantic strings)
-    result["raw_display_data"] = {"sql": result.get("sql_data"), "semantic": result.get("semantic_data")}
+        # Run secondary route (optional, might need adjustment)
+        # Pass the results from the primary execution attempt
+        sql_result_sec, semantic_result_sec = run_secondary_route(
+            refined_query, recommended_route, sql_result, semantic_result,
+            aux_models, conn, selected_db_schema_tables, llm_wrapper, qdrant_client, sample_data_str
+            # Pass keywords?
+        )
+        # Update results if secondary route provided something new/better
+        # (Careful not to overwrite primary errors if secondary also fails)
+        if not result.get("sql_data") and sql_result_sec.get("sql_data") is not None:
+             result["sql_data"] = sql_result_sec.get("sql_data")
+             result["sql_error"] = sql_result_sec.get("sql_error") # Update error too
+             result["generated_sql"] = sql_result_sec.get("generated_sql", result["generated_sql"])
+        if not result.get("semantic_data") and semantic_result_sec.get("semantic_data"):
+             result["semantic_data"] = semantic_result_sec.get("semantic_data")
+             result["semantic_error"] = semantic_result_sec.get("semantic_error")
 
+
+        # Generate final summary using available data
+        nl_summary = generate_final_summary(
+            original_query, refined_query, was_translated,
+            result.get("sql_data"), result.get("semantic_data"), llm_wrapper
+        )
+        result["natural_language_summary"] = nl_summary
+        result["message"] = nl_summary # Final user message is the summary
+
+        # Determine final status based on execution outcomes
+        sql_ok = sql_result.get("sql_success") or sql_result_sec.get("sql_success")
+        sem_ok = semantic_result.get("semantic_success") or semantic_result_sec.get("semantic_success") # Assuming semantic benchmarked elsewhere
+        if sql_ok or sem_ok:
+             result["status"] = "success"
+        elif result["sql_error"] or result["semantic_error"]:
+              result["status"] = "error_execution" # Keep specific error if execution failed
+        else:
+              result["status"] = "success_no_results" # Ran ok but found nothing
+
+        result["raw_display_data"] = {"sql": result.get("sql_data"), "semantic": result.get("semantic_data")}
+
+    # If conn was None, the status will be analysis_complete_*
     return result
 
 # --- NEW Validation Helper ---
@@ -1425,77 +1670,248 @@ def derive_requirements_from_history(conversation_history: list[dict], llm_wrapp
         return "" # Return empty string on error
 
 
-def refine_and_select(user_query: str, conversation_history: list[dict], schema: dict, llm_wrapper: LLMWrapper) -> dict:
-    """
-    Consolidates query refinement, table selection, and routing into a single LLM call.
-    Uses prompt from PROMPTS.
-    Returns a dictionary with keys: "refined_query", "selected_table", "route".
-    Provides fallbacks if LLM fails.
-    """
-    # Default fallbacks
+def refine_and_select(
+    user_query: str,
+    conversation_history: Optional[list[dict]],
+    selected_schema: dict, # Schema for the single selected DB
+    sample_data: Optional[str], # <-- NEW: Sample data string
+    llm_wrapper: LLMWrapper
+) -> dict:
+    """ Refines query, gets keywords, determines route using schema AND sample data. """
+    # Default fallback result
     default_result = {
         "refined_query": user_query,
-        "selected_table": next(iter(schema)) if schema else "", # First table if exists
-        "route": "SQL"
+        "route": "SQL",
+        "augmented_keywords": []
     }
+    recent_context = "\n".join(...) if conversation_history else "No history."
 
     if not llm_wrapper or not llm_wrapper.is_ready:
         logging.warning("LLM wrapper not ready for refine/select/route. Using defaults.")
         return default_result
+    if not selected_schema:
+         logging.warning("No schema provided to refine_and_select. Using defaults.")
+         return default_result
 
+    # Prepare recent conversation context
     recent_context = "\n".join(
         f"{msg['role'].capitalize()}: {msg['content']}"
-        for msg in conversation_history[-10:] # Limit context size
+        for msg in conversation_history[-10:]
     ) if conversation_history else "No previous conversation history."
 
-    # --- Use loaded prompt ---
-    prompt = PROMPTS['refine_and_select'].format(
-        recent_context=recent_context,
-        schema=schema, # Pass the full schema here for table selection
-        user_query=user_query
-    )
-    # --- End Use loaded prompt ---
-    logging.debug(f"Sending refine_and_select prompt to LLM:\n{prompt}")
+    # Format schema as JSON (to help LLM read it cleanly)
+    formatted_schema = json.dumps(selected_schema, indent=2)
+    sample_data_str = sample_data if sample_data is not None else "N/A" # Handle None case
 
     try:
-        # Prefer structured output if available
-        response_data = None
-        if llm_wrapper.mode == 'openrouter':
-            response_data = llm_wrapper.generate_structured_response(prompt)
+        prompt = PROMPTS['refine_and_select'].format( 
+            recent_context=recent_context,
+            user_query=user_query,
+            schema=formatted_schema,
+            sample_data=sample_data_str 
+        )
+        logging.debug(f"Sending refine_and_select prompt:\n{prompt}")
+
+        # --- Generation and Parsing Logic (similar to previous refine_and_select) ---
+        raw_response_content = llm_wrapper.generate_response(prompt, max_tokens=300, temperature=0.2)
+        logging.debug(f"Raw LLM response for refine_and_select: {raw_response_content}")
+        # Clean
+        cleaned_text = raw_response_content.strip()
+        if cleaned_text.startswith("```json"): cleaned_text = cleaned_text[7:]
+        if cleaned_text.startswith("```"): cleaned_text = cleaned_text[3:]
+        if cleaned_text.endswith("```"): cleaned_text = cleaned_text[:-3]
+        cleaned_text = cleaned_text.strip()
+        # Parse
+        try:
+            response_data = json.loads(cleaned_text)
             if not isinstance(response_data, dict):
-                logging.warning(f"Structured refine_and_select failed ({type(response_data)}). Trying text generation.")
-                response_data = None # Force text fallback
+                 logging.error(f"Parsed JSON not dict: {cleaned_text} -> {type(response_data)}")
+                 return default_result
+        except json.JSONDecodeError as e:
+            logging.error(f"JSON parse failed: {e}. Content: '{cleaned_text}'")
+            return default_result
 
-        if response_data is None: # If not openrouter or structured failed
-            response_text = llm_wrapper.generate_response(prompt, max_tokens=250, temperature=0.2) # Increased tokens slightly
-            logging.debug(f"Raw text response for refine_and_select: {response_text}")
-            # Try parsing the text response as JSON
-            cleaned_text = response_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-            try:
-                response_data = json.loads(cleaned_text)
-            except json.JSONDecodeError:
-                logging.error(f"Failed to parse JSON from refine_and_select text response: {cleaned_text}")
-                return default_result # Use defaults if parsing fails
+        # --- Robust Key Access & Validation ---
+        final_result = {}
+        # Note: 'selected_table' is NOT expected here anymore
+        expected_keys = ["refined_query", "augmented_keywords", "route"]
+        found_keys = {key.strip().strip('"'): value for key, value in response_data.items()}
 
-        # Validate the structure of the response_data dict
-        if isinstance(response_data, dict) and \
-           "refined_query" in response_data and \
-           "selected_table" in response_data and \
-           "route" in response_data:
-            # Basic validation of route value
-            if response_data["route"].upper() not in ["SQL", "SEMANTIC"]:
-                 logging.warning(f"LLM returned invalid route '{response_data['route']}'. Defaulting to SQL.")
-                 response_data["route"] = "SQL"
-            # Ensure table exists (though process_natural_language_query does fallback too)
-            if response_data["selected_table"] not in schema:
-                 logging.warning(f"LLM selected non-existent table '{response_data['selected_table']}'. Will use fallback later.")
-                 # Keep the LLM's choice for now, let downstream handle fallback
-            logging.info(f"refine_and_select successful: {response_data}")
-            return response_data
-        else:
-            logging.error(f"LLM response for refine_and_select lacked required keys or wasn't a dict: {response_data}")
-            return default_result # Use defaults if structure is wrong
+        for expected_key in expected_keys:
+            found_value = found_keys.get(expected_key)
+            if found_value is not None: final_result[expected_key] = found_value
+            else:
+                logging.warning(f"LLM missing '{expected_key}' in refine/route response. Using fallback.")
+                final_result[expected_key] = default_result.get(expected_key)
+                if expected_key == "augmented_keywords" and final_result[expected_key] is None: final_result[expected_key] = []
 
+        # --- Post-processing Validation (similar logic) ---
+        if not isinstance(final_result.get("route"), str) or final_result["route"].upper() not in ["SQL", "SEMANTIC"]:
+            final_result["route"] = "SQL" # Default if invalid
+        else: final_result["route"] = final_result["route"].upper()
+
+        if not isinstance(final_result.get("augmented_keywords"), list):
+             final_result["augmented_keywords"] = []
+        else: final_result["augmented_keywords"] = [str(item) for item in final_result["augmented_keywords"] if isinstance(item, (str, int, float))]
+
+        if not isinstance(final_result.get("refined_query"), str): final_result["refined_query"] = default_result["refined_query"]
+
+        logging.info(f"refine_and_select processed result: {final_result}")
+        return final_result
+
+    except KeyError:
+        logging.error("Prompt key 'refine_and_select' not found in prompts.yaml!")
+        return default_result
     except Exception as e:
-        logging.error(f"Error during refine_and_select LLM call: {e}", exc_info=True)
-        return default_result # Use defaults on error
+        logging.error(f"Unexpected error during refine_and_select LLM call: {e}", exc_info=True)
+        return default_result
+    
+
+MAX_SCHEMA_CHARS_ESTIMATE = 20000 # Rough estimate for ~6k-7k tokens
+
+def format_schemas_for_prompt(available_schemas: dict, max_chars: int = MAX_SCHEMA_CHARS_ESTIMATE) -> Tuple[str, bool]:
+    """Formats schemas into a JSON string for the prompt, handling potential truncation."""
+    # Format: { "db_id1": {"table1": ["col1", "col2"], ...}, "db_id2": {...} }
+    full_schemas_str = json.dumps(available_schemas, indent=2)
+    truncated = False
+
+    if len(full_schemas_str) > max_chars:
+        logging.warning(f"Full schema string length ({len(full_schemas_str)} chars) exceeds estimated limit ({max_chars}). Attempting truncation.")
+        truncated = True
+        # Simple truncation strategy: Keep removing schemas until under limit
+        # More sophisticated: Prioritize based on keyword match first (Two-Pass approach needed)
+        schemas_to_include = dict(available_schemas) # Start with a copy
+        while len(json.dumps(schemas_to_include, indent=2)) > max_chars and schemas_to_include:
+             # Remove the 'last' item (arbitrary for dict) - could be improved
+             schemas_to_include.popitem()
+        formatted_str = json.dumps(schemas_to_include, indent=2)
+        if not schemas_to_include:
+             logging.error("Schema string too large even after attempting truncation. Cannot proceed.")
+             return "{}", True # Return empty dict string, signal truncation happened
+
+        logging.warning(f"Truncated schema string length: {len(formatted_str)} chars. Kept {len(schemas_to_include)} schemas.")
+        return formatted_str, truncated
+    else:
+        # Fits within limits
+        return full_schemas_str, truncated
+
+
+def select_database_id(
+    user_query: str,
+    # Pass the formatted string directly
+    formatted_schemas_and_samples_str: str,
+    schemas_were_truncated: bool, # Know if truncation happened
+    available_schema_keys: list, # Pass original keys for validation
+    llm_wrapper: LLMWrapper,
+    conversation_history: Optional[list[dict]] = None # Keep history if prompt uses it
+) -> Optional[str]:
+    """ Uses LLM to select DB ID using formatted schema+sample context. """
+    if not llm_wrapper or not llm_wrapper.is_ready:
+        logging.warning("LLM wrapper not ready for DB ID selection.")
+        return None # Or fallback
+
+    try:
+        prompt = PROMPTS['select_database_id'].format(
+            formatted_schemas_and_samples_str=formatted_schemas_and_samples_str, # Use the formatted (potentially truncated) string
+            user_query=user_query
+        )
+        logging.debug(f"Sending DB ID selection prompt (schemas truncated: {schemas_were_truncated})...")
+        # Log only part of the potentially massive prompt
+        prompt_preview = prompt[:500] + ("..." if len(prompt) > 500 else "")
+        logging.debug(f"Prompt Preview:\n{prompt_preview}")
+
+
+        # Use simple text generation - response should just be the ID string
+        selected_id_raw = llm_wrapper.generate_response(prompt, max_tokens=50, temperature=0.1) # Short response needed
+        # Clean the response robustly
+        selected_id = selected_id_raw.strip().strip('`"\'') # Remove common delimiters
+
+        logging.info(f"LLM suggested DB ID: '{selected_id}' (Raw: '{selected_id_raw}')")
+
+        # --- Validation ---
+        # Check against the ORIGINAL, full list of schemas
+        if selected_id in available_schema_keys:
+            return selected_id
+        else:
+            # LLM failed or hallucinated
+            logging.warning(f"LLM selection '{selected_id}' invalid or not found in available schemas ({list(available_schemas.keys())[:10]}...). Attempting fallback.")
+
+            # --- Fallback Strategy (Simple Keyword Match) ---
+            query_lower = user_query.lower()
+            # Prioritize matching db_id first
+            for db_id in available_schema_keys:
+                 if db_id.lower() in query_lower:
+                      logging.info(f"Fallback: Matched DB ID '{db_id}' in query.")
+                      return db_id
+            
+
+            logging.error("LLM selection failed and fallback keyword match also failed.")
+            return None # Indicate failure
+
+    except KeyError:
+         logging.error("Prompt key 'select_database_id' not found in prompts.yaml!")
+         return None
+    except Exception as e:
+        logging.error(f"Error during DB ID selection LLM call: {e}", exc_info=True)
+        return None
+    
+def get_table_sample_data(conn: sqlite3.Connection, table_name: str, limit: int = 3) -> Optional[str]:
+    """Fetches the first few rows of a table as a DataFrame sample string."""
+    if not conn or not table_name: # Basic check
+        return None
+    try:
+        # Check if table exists first
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?;", (table_name,))
+        if cursor.fetchone() is None:
+             logging.warning(f"Table '{table_name}' not found in DB during sample fetching.")
+             return None # Table doesn't exist
+
+        # Use LIMIT to fetch only a small sample
+        # Quote table name just in case
+        query = f'SELECT * FROM "{table_name}" LIMIT {limit}'
+        df_sample = pd.read_sql_query(query, conn)
+        if df_sample.empty:
+             return f"Table '{table_name}' exists but is empty (sample query returned no rows)."
+        # Convert to markdown, handle potential errors
+        return df_sample.to_markdown(index=False)
+    except pd.io.sql.DatabaseError as e:
+        # Handle cases where query fails even if table exists (e.g., permissions, malformed table)
+        logging.error(f"Pandas SQL Error fetching sample data for table '{table_name}': {e}")
+        return f"Error fetching sample data for table '{table_name}': {e}"
+    except Exception as e:
+        logging.error(f"Unexpected error fetching sample data for table '{table_name}': {e}", exc_info=True)
+        return f"Unexpected error fetching sample for table '{table_name}'."
+    
+def format_context_for_db_selection(
+    available_schemas: dict,
+    db_samples: dict, # NEW: {db_id: sample_string or None}
+    max_chars: int = MAX_SCHEMA_CHARS_ESTIMATE
+) -> Tuple[str, bool]:
+    """Formats schemas AND sample data into a JSON string for the DB selection prompt."""
+
+    context_data = {}
+    for db_id, schema_tables in available_schemas.items():
+        context_data[db_id] = {
+            "schema": schema_tables,
+            "sample_data_snippet": db_samples.get(db_id, "N/A") # Get sample or use placeholder
+        }
+
+    full_context_str = json.dumps(context_data, indent=2)
+    truncated = False
+
+    if len(full_context_str) > max_chars:
+        logging.warning(f"Full schema+sample context length ({len(full_context_str)} chars) exceeds limit ({max_chars}). Truncating.")
+        truncated = True
+        # Simple truncation - remove DBs until it fits. Better pre-filtering needed for prod.
+        context_to_include = dict(context_data)
+        while len(json.dumps(context_to_include, indent=2)) > max_chars and context_to_include:
+             context_to_include.popitem() # Remove arbitrary item
+        formatted_str = json.dumps(context_to_include, indent=2)
+        if not context_to_include:
+             logging.error("Schema+sample context too large even after truncation.")
+             return "{}", True
+        logging.warning(f"Truncated context string length: {len(formatted_str)}. Kept {len(context_to_include)} DB contexts.")
+        return formatted_str, truncated
+    else:
+        return full_context_str, truncated

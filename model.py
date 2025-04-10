@@ -4,7 +4,7 @@ import dotenv
 import torch
 import logging
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-from fast_embed import TextEmbedding
+from fastembed import TextEmbedding
 from huggingface_hub import hf_hub_download
 
 try:
@@ -92,17 +92,22 @@ def load_aux_models():
             # Proceed to load if download/cache check was successful
             if local_sql_model_path and os.path.exists(local_sql_model_path):
                 try:
+                    cpu_only = os.getenv("SQL_RUN_ON_CPU", "false").lower() in ("true", "1")
                     # Get GGUF parameters (same logic as before)
-                    sql_n_gpu_layers_str = os.getenv('SQL_GGUF_N_GPU_LAYERS', os.getenv('GGUF_N_GPU_LAYERS', '-1'))
-                    sql_n_gpu_layers = int(sql_n_gpu_layers_str) if sql_n_gpu_layers_str.lstrip('-').isdigit() else -1
+                    if cpu_only:
+                        sql_n_gpu_layers = 0
+                        logging.info("Forcing CPU-only execution for SQL GGUF model.")
+                    else:
+                        sql_n_gpu_layers_str = os.getenv('SQL_GGUF_N_GPU_LAYERS', os.getenv('GGUF_N_GPU_LAYERS', '-1'))
+                        sql_n_gpu_layers = int(sql_n_gpu_layers_str) if sql_n_gpu_layers_str.lstrip('-').isdigit() else -1
+
                     sql_n_ctx_str = os.getenv('SQL_GGUF_N_CTX', os.getenv('GGUF_N_CTX', '1024'))
                     sql_n_ctx = int(sql_n_ctx_str) if sql_n_ctx_str.isdigit() else 1024
 
                     logging.info(f"Loading SQL GGUF model using llama_cpp from: {local_sql_model_path}")
-                    # logging.info(f"SQL GGUF Params: n_gpu_layers={sql_n_gpu_layers}, n_ctx={sql_n_ctx}")
-
+                    # Create the Llama model instance with the chosen configuration
                     sql_gguf_model = Llama(
-                        model_path=local_sql_model_path, # Use the resolved path
+                        model_path=local_sql_model_path,
                         n_gpu_layers=sql_n_gpu_layers,
                         n_ctx=sql_n_ctx,
                         verbose=True
@@ -125,8 +130,9 @@ def load_aux_models():
     try:
         logging.info("Loading Embedding model (sentence-transformers/paraphrase-multilingual-mpnet-base-v2)...")
         embedding_model_name = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+
         # FastEmbed likely uses huggingface_hub internally too, respecting cache
-        embedding_model = TextEmbedding.add_custom_model(model=embedding_model_name, model_file=cache_dir)
+        embedding_model = TextEmbedding(model=embedding_model_name, model_file=cache_dir)
         models_dict['embedding_model'] = embedding_model
         embed_model_loaded = True
         logging.info("Embedding model loaded successfully.")

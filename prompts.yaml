@@ -24,7 +24,7 @@ route_query_structured: |
 
   Database Schema:
   {schema}
-  {sample_data_context}
+  {sample_data}
   User Query:
   "{user_query}"
 
@@ -36,20 +36,33 @@ route_query_structured: |
 
 # Base prompt for SQL generation
 generate_sql_base: |
-  Given the database schema:
+  You are an expert SQL generator.
+  
+  Given the following information:
+  
+  **Database Schema (in JSON format):**
   {schema}
-
-  {sample_context}
-  Generate an SQLite query to find the data relevant to the user's question. Follow these rules:
-  1. Select `*` or key columns plus relevant value columns.
-  2. Use correct numerical comparisons (e.g., `Count < 5`, not `Count < 5 units`).
-  3. Handle extremes (min/max/top) by retrieving all ties (e.g., using subqueries like `WHERE col = (SELECT MAX(col) ...)` or `ORDER BY ... LIMIT 5` as fallback).
-  4. Avoid unnecessary `ORDER BY` or `LIMIT` otherwise.
-  5. Avoid filtering out all rows unless explicitly requested. 
-  6. Avoid searching by exact match unless specified. Use `LIKE` or `ILIKE` for partial matches.
-  7. Do not make any changes to the database schema or data.
-
-  User question: "{user_query}"
+  
+  **Data Sample (representative sample of the target table):**
+  {sample_data}
+  
+  **User Query:**
+  {user_query}
+  
+  **Augmented Keywords:**
+  {augmented_keywords}
+  
+  Generate an SQLite query to answer the user’s query. Follow these rules:
+  
+  1. Select either `*` or a combination of key and relevant value columns.
+  2. Use appropriate numerical comparisons (for example, write `COUNT < 5` instead of `COUNT < 5 units`).
+  3. When filtering textual fields, incorporate both the exact keyword(s) from the query and the additional augmented keywords (using the LIKE operator for partial matches). Note that SQLite does not support ILIKE; for case-insensitive matching use LOWER(column) LIKE LOWER('%keyword%').
+  4. Handle extremes such as min/max using subqueries (if needed) to include ties.
+  5. Avoid unnecessary clauses like ORDER BY or LIMIT unless they are required to answer the query.
+  6. Do not modify the database schema or data.
+  
+  **Respond ONLY with the complete SQLite query, ending with a semicolon.**
+  
 
 # Addendum for SQL generation retries based on feedback
 generate_sql_feedback_syntax: |
@@ -109,59 +122,59 @@ derive_requirements_from_history: |
   Conversation History:
   {context}
 
-  Please provide a refined summary of the user's requirements that can be used to generate the best search query.
+  Please provide a refined summary of the user's requirements that can be used to generate the best search query for the latest message by the user.
   Refined Requirements:
 
 # Consolidated prompt for refining query, selecting table, and determining route
 refine_and_select: |
-  You are an expert data analyst assisting a user querying a database with potentially multiple tables. Your primary goal is to determine the correct table and the best way to query it based on the user's request and available data structure.
+  You are an expert data analyst assisting a user querying a database with potentially multiple tables. Your primary goal is to determine the correct table and the best way to query it based on the user's request and the available data structure.
 
   **Inputs:**
-  1.  **Conversation History (Last few turns):**
-      {recent_context}
-  2.  **User's Latest Query:** "{user_query}"
-  3.  **Database Schema (Available tables and their columns):**
-      {schema} # Example: {{'sales': ['sale_id', 'product', 'amount', 'date'], 'products': ['product_id', 'name', 'description', 'category']}}
+  1. **Conversation History (Last few turns):**
+     {recent_context}
+  2. **User's Latest Query:** "{user_query}"
+  3. **Database Schema (Target Table and Columns):**
+     {schema}
+  4. **Sample Data (First few rows of a key table)):**
+      {sample_data}  
 
   **Analysis Steps & Output Instructions:**
   Perform the following steps and structure your response as a single JSON object:
 
-  1.  **Identify the Most Relevant Table:**
-      - Carefully analyze the **User's Latest Query** and the **Conversation History**.
-      - Examine the **Database Schema**, paying close attention to the **column names** within each table.
-      - Determine which **single table** from the schema keys is most likely to contain the information needed to answer the query. Consider keywords in the query and how they match table names or, more importantly, column names.
-      - **Output Key:** `"selected_table"`: string (The name of the *single most relevant table*. Choose only one from the schema keys provided.)
+  1. **Identify the Most Relevant Table:**
+     - Analyze the **User's Latest Query** and the **Conversation History**.
+     - Examine the **Database Schema**, paying close attention to the **column names** in each table.
+     - Determine which **single table** from the schema is most likely to contain the information needed to answer the query.
+     - **Output Key:** `"selected_table"`: string (The name of the single most relevant table.)
 
-  2.  **Refine the User Query for the Selected Table:**
-      - Based on the table chosen in Step 1, rewrite the **User's Latest Query** into a more detailed and precise question.
-      - Incorporate context from the **Conversation History** if it clarifies the intent.
-      - The refined query should be specific to the columns and context of the `selected_table`.
-      - **Output Key:** `"refined_query"`: string (The detailed query, tailored for the selected table.)
+  2. **Augment the Query with Additional Keywords:**
+     - Analyze the **User's Latest Query** to identify exact keywords provided by the user.
+     - Also determine one or more augmented keywords or phrases that are semantically related and might improve retrieval coverage.
+     - **Output Key:** `"augmented_keywords"`: list of strings (Additional keywords or phrases that complement the original query.)
 
-  3.  **Determine the Query Route for the Refined Query:**
-      - Considering the nature of the **Refined Query** and the likely data types in the **Selected Table's** columns (e.g., text descriptions vs. numerical values, IDs, dates):
-      - Decide if the query is best answered by generating an exact SQL query ('SQL') to retrieve specific data points, aggregates, or filtered rows.
-      - Or, decide if it's better answered using semantic search ('SEMANTIC') to find information based on meaning, similarity, or within free-text columns (like descriptions, notes, comments).
-      - **Output Key:** `"route"`: string ("SQL" or "SEMANTIC")
+  3. **Determine the Query Route:**
+     - Based on the nature of the **Refined Query** and the likely data types in the **Selected Table’s** columns, decide whether to use an exact SQL query ('SQL') for structured retrieval or semantic search ('SEMANTIC') for unstructured text.
+     - **Output Key:** `"route"`: string ("SQL" or "SEMANTIC")
 
-  **Respond ONLY with a valid JSON object containing these three keys.**
-
+  **Respond ONLY with a valid JSON object containing these keys.**
+  The JSON object should be structured as follows:
+  
   **Example 1 (SQL Route):**
   ```json
-  {{
-    "selected_table": "sales",
-    "refined_query": "Calculate the total sales amount for the product 'Laptop' in the month of June 2024.",
-    "route": "SQL"
-  }}
+  {
+      "refined_query": "Calculate the total sales amount for the product 'Laptop' in the month of June 2024.",
+      "augmented_keywords": ["Laptop", "sales total", "June 2024"],
+      "route": "SQL"
+  }
   
   **Example 2 (Semantic Route):**
 
   ```json      
-  {{
-    "selected_table": "products",
-    "refined_query": "Find products with descriptions similar to 'lightweight and portable laptop for travel'.",
-    "route": "SEMANTIC"
-  }}
+  {
+      "refined_query": "Find products with descriptions similar to 'lightweight and portable laptop for travel'.",
+      "augmented_keywords": ["lightweight", "portable", "travel", "laptop"],
+      "route": "SEMANTIC"
+  }
 
     
 
@@ -177,3 +190,19 @@ generate_final_summary: |
   ---
 
   Answer:
+
+select_database_id: |
+  You are a database schema expert. Your task is to identify the SINGLE most relevant database ID to answer the user's query, given a list of databases and their detailed schemas (tables and columns).
+
+  **Instructions:**
+  1. Analyze the **User Query** carefully.
+  2. Examine the schemas provided under **Available Databases**. Pay close attention to **table names AND column names** within each database ID.
+  3. Match keywords, concepts, and entities mentioned in the query to the database that most likely contains the relevant tables and columns.
+  4. Respond ONLY with the single database ID string (the top-level key from the schema list) that is the best fit. Do not add any explanation.
+
+  **Available Databases (Schema Details & Sample Data Snippet):**
+  ```json
+  {formatted_schemas_and_samples_str}
+
+
+  ** User Query:** {user_query}

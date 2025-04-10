@@ -21,7 +21,7 @@ except ImportError:
     logging.warning("llama_cpp library not found. Local GGUF mode disabled.")
 
 # --- Load Environment Variables ---
-load_dotenv('.env')
+load_dotenv('.env', override=True)
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -82,9 +82,9 @@ class LLMWrapper:
                 logging.error("DEVELOPMENT_MODE is false, but llama_cpp is not installed.")
                 return
 
-            model_path = os.getenv('GGUF_MODEL_PATH')
+            model_path = os.getenv('LOCAL_LLM_GGUF_MODEL_PATH')
             if not model_path or not os.path.exists(model_path):
-                logging.error(f"GGUF_MODEL_PATH env var not set or path invalid: '{model_path}'")
+                logging.error(f"LOCAL_LLM_GGUF_MODEL_PATH env var not set or path invalid: '{model_path}'")
                 return
 
             try:

@@ -34,7 +34,7 @@ aux_models = get_cached_aux_models()
 
 
 # --- Perform Readiness Checks ---
-print(f"DEBUG [app.py Readiness Check]: Type of aux_models before status check: {type(aux_models)}")
+
 aux_models_ready = isinstance(aux_models, dict) and aux_models.get("status") == "loaded"
 db_ready = db_conn is not None
 qdrant_ready = qdrant_client is not None
@@ -322,13 +322,17 @@ with tab_data_manage:
         overview_data = []
         for table_name, columns in current_schema.items():
             row_count = get_sqlite_table_row_count(db_conn, table_name)
-            qdrant_collection_name = f"{QDRANT_COLLECTION_PREFIX}{table_name}"
-            qdrant_info = get_qdrant_collection_info(qdrant_client, qdrant_collection_name) if qdrant_ready else None
+            collection_name = f"{QDRANT_COLLECTION_PREFIX}{table_name}"
+            # Use the new helper to fetch the most recent collection info for this table.
+            qdrant_info = get_qdrant_collection_info(qdrant_client, collection_name ) if qdrant_ready else None
+            
+            # Display the collection name if found, else note as "Not Found"
+            collection_display = qdrant_info.get("collection_name") if qdrant_info else "Not Found"
             overview_data.append({
                 "Table Name": table_name,
                 "Columns": len(columns),
                 "SQLite Rows": row_count if row_count is not None else "N/A",
-                "Vector Collection": qdrant_collection_name if qdrant_info else ("Not Found" if qdrant_ready else "Qdrant N/A"),
+                "Vector Collection": collection_display,
                 "Vector Points": qdrant_info.get("points_count", "N/A") if qdrant_info else "N/A",
                 "Vector Dim": qdrant_info.get("vector_size", "N/A") if qdrant_info else "N/A"
             })
@@ -336,16 +340,10 @@ with tab_data_manage:
 
         # Detailed view per table
         with st.expander("Show Table Schema Details"):
-            if not current_schema:
-                 st.caption("No tables loaded.")
-            else:
-                for table_name, columns in current_schema.items():
-                    st.markdown(f"**Table: `{table_name}`**")
-                    # Display columns in a more readable format, e.g., bullet points or columns
-                    cols_md = "\n".join([f"- `{col}`" for col in columns])
-                    st.markdown(cols_md)
-                    # st.write("Columns:", ", ".join([f"`{col}`" for col in columns])) # Alternative single line
-
+            for table_name, columns in current_schema.items():
+                st.markdown(f"**Table: `{table_name}`**")
+                cols_md = "\n".join([f"- `{col}`" for col in columns])
+                st.markdown(cols_md)
     st.markdown("---")
 
     # --- Section 3: Manage Existing Tables ---
