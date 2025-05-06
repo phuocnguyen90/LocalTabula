@@ -1,0 +1,57 @@
+# Remember to change this file name to ".env" after adding the credentials/configurations
+DEVELOPMENT_MODE=false
+
+# API KEYS
+# HF token is needed for downloading certain models
+HF_TOKEN=
+
+# Ngrok token is needed for tunneling the streamlit app when using Google Colab
+NGROK_AUTH_TOKEN=
+
+# Google client ID is needed to give access to your own google files
+# GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET:  
+# OAuth2 credentials for Google API access.  
+# Required if you want to load data from your own Google Sheets / Drive.
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+# GOOGLE_PROJECT_ID:  
+# (Optional) Your Google Cloud project identifier.  
+# Used in some GCP-related workflows or billing setups.
+GOOGLE_PROJECT_ID="YOUR_GCP_PROJECT_ID_HERE"
+
+# OPENROUTER_API_KEY:  API key for the OpenRouter LLM proxy service.
+OPENROUTER_API_KEY=
+# Name or path of the LLM model served via OpenRouter.
+# Example: using Gemma-3 4B model hosted on “free” tier.
+OPENROUTER_MODEL_NAME="google/gemma-3-4b-it:free"
+
+# GROQ_API_KEY / GROQ_API_URL:  
+# Credentials and endpoint for Groq’s inference API (if you’re using Groq hardware).
+GROQ_API_KEY=
+GROQ_API_URL="https://api.groq.com/v1"
+
+
+# --- Local Mode (Main LLM GGUF) ---
+SQL_GGUF_MODEL_PATH=https://huggingface.co/afrideva/pip-sql-1.3b-GGUF/resolve/main/pip-sql-1.3b.Q5_K_M.gguf
+SQL_GGUF_REPO_ID=afrideva/pip-sql-1.3b-GGUF
+SQL_GGUF_FILENAME=pip-sql-1.3b.Q5_K_M.gguf
+
+# Whether to force model inference on CPU (true) or allow GPU (false).
+SQL_USE_CPU=false
+# How many of the top layers to offload to GPU (–1 = all layers on GPU).
+SQL_GPU_LAYERS=-1
+# (Optional) Alternate local GGUF model for your main chat LLM.
+LOCAL_LLM_GGUF_MODEL_PATH=
+LOCAL_LLM_GGUF_REPO_ID=google/gemma-3-4b-it
+LOCAL_LLM_GGUF_FILENAME=google_gemma-3-4b-it-Q5_K_M.gguf
+# CPU/GPU control for the main LLM.
+LLM_USE_CPU=false
+LLM_GPU_LAYERS=-1
+# --- Embedding model ---
+EMBEDDING_MODEL_NAME=sentence-transformers/paraphrase-multilingual-mpnet-base-v2
+EMBEDDING_VECTOR_SIZE=768
+# --- Production/Local Mode (Main LLM GGUF) ---
+GGUF_MODEL_PATH=./models/google_gemma-3-4b-it-Q5_K_M.gguf
+GGUF_N_GPU_LAYERS=-1
+# Maximum context window for the GGUF LLM (how many tokens it can handle).
+GGUF_N_CTX=8192
