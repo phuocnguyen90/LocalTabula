@@ -8,14 +8,14 @@ import torch
 torch.classes.__path__ = [] # Clear the path to avoid loading Torch classes
 
 # Import functions from utils.py
-from utils import (
+from utils.utils import (
     setup_environment, get_db_connection, init_qdrant_client, get_llm_wrapper,
     get_cached_aux_models, get_schema_info, process_uploaded_data,
     process_natural_language_query, table_exists,
     get_sqlite_table_row_count, get_qdrant_collection_info,
     reindex_table, delete_table_data,
     derive_requirements_from_history,
-    QDRANT_COLLECTION_PREFIX  
+    QDRANT_COLLECTION_PREFIX
 )
 
 # --- Config Logging & Filter ---
@@ -31,6 +31,12 @@ db_conn = get_db_connection(DB_PATH)
 qdrant_client = init_qdrant_client()
 llm_wrapper = get_llm_wrapper()
 aux_models = get_cached_aux_models()
+
+# --- Check if GPU is available ---
+if torch.cuda.is_available():
+    logging.info("GPU is available.")
+else:
+    logging.info("GPU is not available. Using CPU.")
 
 
 # --- Perform Readiness Checks ---
@@ -61,8 +67,9 @@ if not core_resources_ok:
 if "messages" not in st.session_state:
     st.session_state.messages = [{"role": "assistant", "content": "Hi! Load data via the Data Management tab, then ask questions here."}]
 if "schema" not in st.session_state:
+    raw_schema = get_schema_info(db_conn) if db_ready else {}
     # Ensure db_conn is valid before getting schema
-    st.session_state.schema = get_schema_info(db_conn) if db_ready else {}
+    st.session_state.schema = {"default": raw_schema}
     logging.info(f"Initial schema loaded: {list(st.session_state.schema.keys())}")
 # Flags for data loading confirmation workflow
 if "confirm_replace_needed" not in st.session_state:
@@ -157,7 +164,7 @@ with tab_chat:
                 result = process_natural_language_query(
                     original_query=refined_requirements,
                     conn=db_conn,
-                    schema=st.session_state.schema,
+                    full_schema=st.session_state.schema,
                     llm_wrapper=llm_wrapper,
                     aux_models=aux_models,
                     qdrant_client=qdrant_client,

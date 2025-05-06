@@ -10,9 +10,9 @@ import uuid
 import json
 import dotenv
 import numpy as np
+from pathlib import Path
 from typing import List, Dict, Any, Set, Tuple, Optional
 import re
-# --- NEW: Load environment variables from .env file ---
 from dotenv import load_dotenv
 import yaml # <-- NEW: Import YAML
 import logging
@@ -31,38 +31,33 @@ from llm_interface import LLMWrapper
 from model import load_aux_models # Renamed import
 
 
-dotenv.load_dotenv('.env', override=True) # Searches for .env file and loads variables
+BASE_DIR = Path(__file__).resolve().parent.parent
+CONFIG_DIR = BASE_DIR / "config"
+PROMPT_PATH = CONFIG_DIR / "prompts.yaml"
+PROMPT_FILE = "prompts.yaml"
+PROMPT_PATH = CONFIG_DIR / PROMPT_FILE
+ENV_PATH = CONFIG_DIR / ".env"
+load_dotenv(dotenv_path=str(ENV_PATH))  
 
 SQLITE_TIMEOUT_SECONDS = 15
 # SHEETS_SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly'] # Keep if using private sheets
 # DRIVE_SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 # ALL_SCOPES = SHEETS_SCOPES + DRIVE_SCOPES
 QDRANT_COLLECTION_PREFIX = "table_data_"
-PROMPT_FILE = "prompts.yaml" # <-- NEW: Define prompt file path
 
-# --- NEW: Load Prompts ---
-@st.cache_data # Cache the loaded prompts
-def load_prompts(filepath=PROMPT_FILE):
-    """Loads prompts from a YAML file."""
-    try:
-        with open(filepath, 'r') as f:
-            prompts = yaml.safe_load(f)
-            logging.info(f"Prompts loaded successfully from {filepath}")
-            return prompts
-    except FileNotFoundError:
-        logging.error(f"FATAL: Prompts file not found at {filepath}")
-        st.error(f"Error: Prompts file '{filepath}' not found. Cannot continue.")
-        return None # Indicate failure
-    except yaml.YAMLError as e:
-        logging.error(f"FATAL: Error parsing YAML file {filepath}: {e}")
-        st.error(f"Error: Could not parse prompts file '{filepath}'. Check its format.")
-        return None # Indicate failure
-    except Exception as e:
-        logging.error(f"FATAL: Unexpected error loading prompts from {filepath}: {e}")
-        st.error(f"An unexpected error occurred loading prompts: {e}")
-        return None
+
+# --- Load Prompts ---
+def load_prompts():
+    """
+    Returns a dict (or list) from your prompt YAML file.
+    """
+    prompts = yaml.safe_load(PROMPT_PATH.open())
+    logging.info("Loaded prompts keys:", list(prompts.keys()))
+    return prompts
+    
 
 PROMPTS = load_prompts() # Load prompts globally for the module
+
 
 # Ensure prompts loaded before proceeding
 if PROMPTS is None:
@@ -893,7 +888,7 @@ def _generate_sql_query(
     sample_context = f"Data Sample (representative table):\n{sample_data_str}\n" if sample_data_str else "Sample data not available.\n"
     prompt_context = {
         "schema": json.dumps(schema, indent=2), # Format schema as JSON string
-        "sample_context": sample_context,
+        "sample_data": sample_context,
         "user_query": refined_query_input, # Use the refined query received as input
         "augmented_keywords": augmented_keywords if augmented_keywords else []
     }
@@ -913,7 +908,7 @@ def _generate_sql_query(
     prompt = "\n".join(prompt_parts)
     # --- End Prompt Construction ---
 
-    logging.info(f"Sending prompt to SQL GGUF model (Retry Attempt? {'Yes' if previous_sql else 'No'}):\n{prompt}")
+    logging.debug(f"Sending prompt to SQL GGUF model (Retry Attempt? {'Yes' if previous_sql else 'No'}):\n{prompt}")
     try:
         output = sql_llm(
             prompt, max_tokens=500, temperature=0.1, top_p=0.9,
@@ -951,7 +946,14 @@ def _execute_sql_query(conn, sql_query):
         return pd.DataFrame(), "Database connection is not available."
     try:
         logging.info(f"Executing SQL: {sql_query}")
+        start_time = 0.0
+        end_time = 0.0
+        duration = 0.0
+        start_time = time.perf_counter()
         result_df = pd.read_sql_query(sql_query, conn)
+        end_time = time.perf_counter()
+        duration = end_time - start_time
+        logging.info(f"SQL execution time: {duration:.2f} seconds")
         logging.info("SQL execution successful.")
         return result_df, None # Data, No error message
     except pd.io.sql.DatabaseError as e:
@@ -1042,13 +1044,6 @@ def validate_inputs(query: str, conn, schema: dict, llm_wrapper, qdrant_client) 
     if not llm_wrapper: return {"status": "error", "message": "LLM wrapper not available."}
     if not qdrant_client: return {"status": "error", "message": "Qdrant client not available."}
     return {"status": "ok"}
-
-def get_table_sample_data(conn, table_name: str, limit: int = 3) -> str:
-    """Gets sample data as a markdown string."""
-    sample_df = _get_table_sample_df(conn, table_name, limit=limit)
-    if sample_df is None: return f"Could not retrieve sample for table '{table_name}'."
-    if sample_df.empty: return f"Table '{table_name}' exists but is empty."
-    return sample_df.to_markdown(index=False)
 
 
 def _ensure_english_query(user_query: str, llm_wrapper: LLMWrapper) -> tuple[str, bool]:
@@ -1319,12 +1314,11 @@ def process_natural_language_query(
     selected_db_id = None
     formatted_context_for_selection = "{}" # Default empty
     schemas_truncated = False
-    # --- Stage 1: Select Database ID ---
+    # --- Stage 0: Select Database ID ---
     logging.info("Stage 1: Selecting Database ID...")
     if pre_selected_db_id and pre_selected_db_id in schema:
         selected_db_id = pre_selected_db_id
-    else:
-        logging.info("Stage 1: Selecting Database ID...")
+    else:        
         temp_schemas_for_prompt, schemas_truncated = format_schemas_for_prompt(schema) # Use schema-only formatter
 
         selected_db_id = select_database_id(
@@ -1335,6 +1329,7 @@ def process_natural_language_query(
             llm_wrapper,
             current_conversation_history
         )
+        logging.info(f"Stage 1: Selected DB ID = {selected_db_id}")
 
     
     if not selected_db_id or selected_db_id not in schema:
@@ -1345,16 +1340,20 @@ def process_natural_language_query(
 
     logging.info(f"Stage 1 Result: Selected DB ID = {selected_db_id}")
     result["selected_db_id"] = selected_db_id
-    selected_db_schema_tables = schema[selected_db_id] # Get tables for the selected DB
-
-    # --- Stage 1.5: Get Sample Data for the SELECTED DB ---
-    # This requires a connection. If conn is None (like in benchmark first pass),
-    # sample_data will be None, and subsequent stages must handle it.
-    sample_data_str_selected = None
-    if conn:
-        first_table_in_selected_db = next(iter(selected_db_schema_tables), None)
-        if first_table_in_selected_db:
-            sample_data_str_selected = get_table_sample_data(conn, first_table_in_selected_db, limit=3)
+    selected_db_schema_tables = schema[selected_db_id] 
+    # --- Stage 1: Get Sample Data ---
+    if selected_db_id:
+        sample_data_str_selected = get_table_sample_data(conn, selected_db_id, limit=3)
+        if not sample_data_str_selected:
+            msg = f"Could not retrieve sample data for selected DB ID '{selected_db_id}'."
+            logging.error(msg + " Cannot proceed.")
+            result.update({"status": "error", "message": msg})
+            return result
+    else:
+        msg = f"Selected DB ID '{selected_db_id}' not found in schema."
+        logging.error(msg + " Cannot proceed.")
+        result.update({"status": "error", "message": msg})
+        return result
 
 
     # --- Stage 2: Refine Query and Determine Route ---
@@ -1443,7 +1442,7 @@ def process_natural_language_query(
         # Pass the results from the primary execution attempt
         sql_result_sec, semantic_result_sec = run_secondary_route(
             refined_query, recommended_route, sql_result, semantic_result,
-            aux_models, conn, selected_db_schema_tables, llm_wrapper, qdrant_client, sample_data_str
+            aux_models, conn, selected_db_schema_tables, llm_wrapper, qdrant_client, sample_data_str_selected
             # Pass keywords?
         )
         # Update results if secondary route provided something new/better
@@ -1806,15 +1805,20 @@ def select_database_id(
     conversation_history: Optional[list[dict]] = None # Keep history if prompt uses it
 ) -> Optional[str]:
     """ Uses LLM to select DB ID using formatted schema+sample context. """
+    template = PROMPTS.get('select_database_id')
+    if template is None:
+        logging.error("PROMPTS has no 'select_database_id' key—aborting.")
+        return None
+
     if not llm_wrapper or not llm_wrapper.is_ready:
         logging.warning("LLM wrapper not ready for DB ID selection.")
         return None # Or fallback
 
     try:
-        prompt = PROMPTS['select_database_id'].format(
-            formatted_schemas_and_samples_str=formatted_schemas_and_samples_str, # Use the formatted (potentially truncated) string
+        prompt = template.format(
+            formatted_schemas_and_samples_str=formatted_schemas_and_samples_str,
             user_query=user_query
-        )
+            )
         logging.debug(f"Sending DB ID selection prompt (schemas truncated: {schemas_were_truncated})...")
         # Log only part of the potentially massive prompt
         prompt_preview = prompt[:500] + ("..." if len(prompt) > 500 else "")
@@ -1834,7 +1838,7 @@ def select_database_id(
             return selected_id
         else:
             # LLM failed or hallucinated
-            logging.warning(f"LLM selection '{selected_id}' invalid or not found in available schemas ({list(available_schemas.keys())[:10]}...). Attempting fallback.")
+            logging.warning(f"LLM selection '{selected_id}' invalid or not found in available schemas ({list(available_schema_keys.keys())[:10]}...). Attempting fallback.")
 
             # --- Fallback Strategy (Simple Keyword Match) ---
             query_lower = user_query.lower()
@@ -1842,15 +1846,14 @@ def select_database_id(
             for db_id in available_schema_keys:
                  if db_id.lower() in query_lower:
                       logging.info(f"Fallback: Matched DB ID '{db_id}' in query.")
-                      return db_id
-            
+                      return db_id       
 
             logging.error("LLM selection failed and fallback keyword match also failed.")
             return None # Indicate failure
 
     except KeyError:
-         logging.error("Prompt key 'select_database_id' not found in prompts.yaml!")
-         return None
+        logging.error("Prompt key 'select_database_id' not found in prompts.yaml!")
+        return None
     except Exception as e:
         logging.error(f"Error during DB ID selection LLM call: {e}", exc_info=True)
         return None

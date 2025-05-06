@@ -34,6 +34,15 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%
 
 # --- Helper Functions ---
 
+def append_result_to_jsonl(result_dict: dict, filepath: str):
+    """Appends a dictionary as a JSON line to the specified file."""
+    try:
+        json_string = json.dumps(result_dict)
+        with open(filepath, 'a') as f: # Use 'a' for append mode
+            f.write(json_string + '\n')
+    except Exception as e:
+        logging.error(f"Failed to append result to {filepath}: {e} | Data: {result_dict}")
+
 def load_schemas_from_tables_json(tables_file: str) -> Dict[str, Dict[str, List[str]]]:
     """
     Loads database schemas directly from a Spider-like tables.json file.
@@ -81,6 +90,8 @@ def run_randomized_benchmark(
     qdrant_client,
     conversation_history=[], 
     num_schema_subset: int = 20,
+    results_filepath: str = "benchmark_randomized_results.jsonl",
+    sample_result_dict: Optional[Dict[str, Any]] = None
 
     ):
     """Runs the benchmark evaluation loop on randomly sampled examples."""
@@ -150,7 +161,11 @@ def run_randomized_benchmark(
     results_summary = []
     count = 0
     pipeline_analysis_success_sql = 0 # Succeeded analysis & SQL Generation
-    analysis_errors = 0              
+    analysis_errors = 0    
+    # --- Lists to store execution times for aggregation ---
+    gen_sql_exec_times = []
+    gold_sql_exec_times = []
+    # ---          
 
     with tempfile.TemporaryDirectory() as temp_dir:
         logging.info(f"Using temporary directory for databases: {temp_dir}")
@@ -171,6 +186,8 @@ def run_randomized_benchmark(
             exec_success_flag = False
             match_success_flag = False
             sample_data_str_actual = None # To store sample data for the actual DB
+            gen_exec_time = 0.0 # Initialize execution times
+            gold_exec_time = 0.0 # Initialize execution times
 
             # --- Pre-fetch Sample Data & Prepare LLM Context ---
             # 1. Setup ACTUAL DB temporarily to get sample data
@@ -233,6 +250,9 @@ def run_randomized_benchmark(
 
             # --- 1. Run Analysis & Generation (conn=None) ---
             try:
+                pipeline_time = None
+                gen_sql_exec_time = None
+                gold_sql_exec_time = None
                 start_time = time.time()
                 pipeline_result = process_natural_language_query(
                     original_query=example['question'],
@@ -291,7 +311,9 @@ def run_randomized_benchmark(
                     try:
                         with sqlite3.connect(temp_db_path, timeout=10) as temp_conn:
                             # Execute Generated SQL
-                            gen_results, gen_sql_exec_error = robust_execute_sql(temp_conn, generated_sql)
+                            start_gen_exec = time.time()
+                            gen_results, gen_sql_exec_error, sql_exec_duration = robust_execute_sql(temp_conn, generated_sql)
+                            gen_sql_exec_time = time.time() - start_gen_exec
                             if gen_sql_exec_error:
                                 pipeline_status = "Generated SQL Execution Failed"
                                 logging.warning(f"Generated SQL execution failed: {gen_sql_exec_error}")
@@ -302,7 +324,9 @@ def run_randomized_benchmark(
                                 logging.debug("Generated SQL executed successfully.")
 
                                 # Execute Gold SQL
-                                gold_results, gold_sql_exec_error = robust_execute_sql(temp_conn, example['query'])
+                                start_gold_exec = time.time()
+                                gold_results, gold_sql_exec_error, sql_exec_duration = robust_execute_sql(temp_conn, example['query'])
+                                gold_sql_exec_time = time.time() - start_gold_exec
                                 if gold_sql_exec_error:
                                     pipeline_status = "Gold SQL Execution Failed"
                                     logging.warning(f"Gold SQL failed execution! Error: {gold_sql_exec_error}")
@@ -343,6 +367,32 @@ def run_randomized_benchmark(
                 "gold_sql_exec_error": gold_sql_exec_error, "exec_success": exec_success_flag,
                 "match_success": match_success_flag
             })
+
+             # --- Prepare result dictionary for this sample ---
+            sample_result_dict = {
+                "original_index": example.get('original_index', 'N/A'),
+                "actual_db_id": actual_db_id,
+                "question": example['question'],
+                "gold_sql": example['query'],
+                "pipeline_status": pipeline_status,
+                "pipeline_error": pipeline_error_msg,
+                "determined_route": determined_route,
+                "selected_db_id_by_llm": selected_db_id,
+                "generated_sql": generated_sql,
+                "generated_sql_exec_error": gen_sql_exec_error,
+                "gold_sql_exec_error": gold_sql_exec_error,
+                "exec_success": exec_success_flag,
+                "match_success": match_success_flag,
+                "sample_data": sample_data_str_actual,
+                "pipeline_time": pipeline_time,
+                "generated_sql_exec_time": gen_sql_exec_time,
+                "gold_sql_exec_time": gold_sql_exec_time
+            }
+
+
+            # --- Append result to file ---
+            append_result_to_jsonl(sample_result_dict, results_filepath)
+            # ---
             # --- End Example Loop ---
 
     # --- Calculate Metrics ---
@@ -388,6 +438,7 @@ def main():
     parser.add_argument("--num_schemas", type=int, default=20, help="Number of random schemas to provide as context for DB selection.") # <-- New Arg
     parser.add_argument("--results_out", default="benchmark_randomized_results.json", help="Path to save detailed benchmark results.")
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Set the logging level.")
+    
     args = parser.parse_args()
 
     logging.getLogger().setLevel(args.log_level.upper())

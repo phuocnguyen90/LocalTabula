@@ -193,30 +193,49 @@ def setup_temp_database(db_id: str, db_base_dir: str, temp_dir: str) -> Optional
              logging.error(f"Underlying directory also not found: {abs_db_subdir}")
         return None
 
-def robust_execute_sql(conn: sqlite3.Connection, query: str) -> Tuple[Optional[Set[Tuple]], Optional[str]]:
-    """Executes SQL, returns results set or error message."""
+def robust_execute_sql(conn: sqlite3.Connection, query: str) -> Tuple[Optional[Set[Tuple]], Optional[str], float]:
+    """
+    Executes SQL, returns results set or error message, and execution time in seconds.
+    """
     results_set: Optional[Set[Tuple]] = None
     error_message: Optional[str] = None
+    start_time = 0.0
+    end_time = 0.0
+    duration = 0.0
+
     try:
         query = query.strip().rstrip(';')
         if not query:
-            return set(), None
+            return set(), None, 0.0 # Empty query takes no time
+
+        start_time = time.perf_counter() # Start timer just before execution
 
         cursor = conn.cursor()
         cursor.execute(query)
-
-        # Fetch results and convert to set of string tuples for robust comparison
         rows = cursor.fetchall()
+
+        end_time = time.perf_counter() # Stop timer immediately after execution
+        duration = end_time - start_time
+
+        # Process results after timing
         results_set = set(tuple(map(str, row)) for row in rows)
 
     except sqlite3.Error as db_err:
+        end_time = time.perf_counter() # Still record time if error occurs during/after exec
+        duration = end_time - start_time if start_time > 0 else 0.0
         error_message = f"SQLite Execution Error: {db_err}"
-        logging.warning(f"Query failed: {query} | Error: {error_message}")
+        logging.warning(f"Query failed ({duration:.4f}s): {query} | Error: {error_message}")
     except Exception as e:
+        end_time = time.perf_counter() # Record time on general error too
+        duration = end_time - start_time if start_time > 0 else 0.0
         error_message = f"General Execution Error: {type(e).__name__}: {e}"
-        logging.error(f"Unexpected error executing query: {query} | Error: {error_message}", exc_info=False)
+        logging.error(f"Unexpected error executing query ({duration:.4f}s): {query} | Error: {error_message}", exc_info=False)
+    # No finally needed as duration is updated in except blocks
 
-    return results_set, error_message
+    if error_message is None:
+        logging.debug(f"Query executed successfully ({duration:.4f}s)")
+
+    return results_set, error_message, duration # Return duration
 
 def compare_results(gold_results: Optional[Set[Tuple]], gen_results: Optional[Set[Tuple]]) -> bool:
     """
@@ -343,7 +362,7 @@ def run_benchmark(dataset: List[Dict[str, Any]], db_dir: str, llm_wrapper, aux_m
                     else:
                         # 4. Execute Generated SQL
                         logging.debug("Executing Generated SQL...")
-                        gen_results, gen_error = robust_execute_sql(temp_conn, gen_sql)
+                        gen_results, gen_error, sql_exec_duration = robust_execute_sql(temp_conn, gen_sql)
                         if gen_error:
                             status = "Generated SQL Execution Failed"
                         else:
@@ -354,7 +373,7 @@ def run_benchmark(dataset: List[Dict[str, Any]], db_dir: str, llm_wrapper, aux_m
 
                             # 5. Execute Gold SQL (only if generated SQL executed)
                             logging.debug("Executing Gold SQL...")
-                            gold_results, gold_error = robust_execute_sql(temp_conn, example['query'])
+                            gold_results, gold_error, sql_exec_duration = robust_execute_sql(temp_conn, example['query'])
                             if gold_error:
                                 status = "Gold SQL Execution Failed"
                                 logging.warning(f"Gold SQL failed execution! Error: {gold_error}")

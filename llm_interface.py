@@ -3,6 +3,7 @@ import os
 import logging
 from dotenv import load_dotenv
 import json
+import torch
 
 # Conditional Imports
 try:
@@ -28,86 +29,104 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 class LLMWrapper:
     """
-    A wrapper to interact with LLMs either via OpenRouter API (Dev Mode)
-    or a local GGUF model (Production/Local Mode).
+    A wrapper to interact with LLMs via OpenRouter (dev) or a local GGUF model (prod).
+    In prod, will load the GGUF into GPU memory if available.
     """
     def __init__(self):
-        self.mode = None # 'openrouter' or 'local_gguf'
+        self.mode = None           # 'openrouter' or 'local_gguf'
         self.openrouter_client = None
         self.openrouter_model_name = None
         self.local_model = None
         self.is_ready = False
 
-        # Determine mode from environment variable
-        dev_mode_str = os.getenv('DEVELOPMENT_MODE', 'false').lower()
-        is_dev_mode = dev_mode_str in ('true', '1', 't', 'yes', 'y')
-
-        if is_dev_mode:
-            logging.info("Attempting to initialize in DEVELOPMENT mode (OpenRouter API)...")
-            self.mode = 'openrouter'
-            if not openai_available:
-                logging.error("DEVELOPMENT_MODE is true, but openai library is not installed.")
-                return # Cannot initialize
-
-            api_key = os.getenv('OPENROUTER_API_KEY')
-            model_name = os.getenv('OPENROUTER_MODEL_NAME')
-
-            if not api_key:
-                logging.error("DEVELOPMENT_MODE is true, but OPENROUTER_API_KEY env var is not set.")
-                return
-            if not model_name:
-                logging.error("DEVELOPMENT_MODE is true, but OPENROUTER_MODEL_NAME env var is not set.")
-                return
-
-            try:
-                # Configure the OpenAI client to point to OpenRouter
-                self.openrouter_client = OpenAI(
-                    base_url="https://openrouter.ai/api/v1",
-                    api_key=api_key,
-                )
-                self.openrouter_model_name = model_name
-                # Optional: Add a simple check like listing models? Be careful with rate limits.
-                # Or just assume it's ready if config is present.
-                self.is_ready = True
-                logging.info(f"OpenRouter client initialized successfully for model: {self.openrouter_model_name}")
-
-            except Exception as e:
-                logging.error(f"Failed to initialize OpenRouter client: {e}", exc_info=True)
-                # self.is_ready remains False
-
-        else: # Production / Local GGUF Mode
-            logging.info("Attempting to initialize in PRODUCTION mode (Local GGUF)...")
-            self.mode = 'local_gguf'
-            if not llama_cpp_available:
-                logging.error("DEVELOPMENT_MODE is false, but llama_cpp is not installed.")
-                return
-
-            model_path = os.getenv('LOCAL_LLM_GGUF_MODEL_PATH')
-            if not model_path or not os.path.exists(model_path):
-                logging.error(f"LOCAL_LLM_GGUF_MODEL_PATH env var not set or path invalid: '{model_path}'")
-                return
-
-            try:
-                n_gpu_layers_str = os.getenv('GGUF_N_GPU_LAYERS', '-1')
-                n_gpu_layers = int(n_gpu_layers_str) if n_gpu_layers_str.lstrip('-').isdigit() else -1
-                n_ctx_str = os.getenv('GGUF_N_CTX', '2048')
-                n_ctx = int(n_ctx_str) if n_ctx_str.isdigit() else 2048
-
-                logging.info(f"Loading GGUF model from: {model_path}")
-                logging.info(f"GGUF Params: n_gpu_layers={n_gpu_layers}, n_ctx={n_ctx}")
-
-                self.local_model = Llama(
-                    model_path=model_path, n_gpu_layers=n_gpu_layers,
-                    n_ctx=n_ctx, verbose=True
-                )
-                self.is_ready = True
-                logging.info("Local GGUF model loaded successfully.")
-
-            except Exception as e:
-                logging.error(f"Failed to load GGUF model from '{model_path}': {e}", exc_info=True)
+        # 1) Dev vs Prod
+        is_dev = os.getenv("DEVELOPMENT_MODE", "false").lower() in ("true","1","t","y","yes")
+        if is_dev:
+            self._init_openrouter()
+        else:
+            self._init_local_gguf()
 
         if not self.is_ready:
-             logging.warning("LLMWrapper initialization failed. generate_response will not work.")
+            logging.warning("LLMWrapper initialization failed; generate_response will not work.")
+
+    def _init_openrouter(self):
+        logging.info("Initializing in DEVELOPMENT mode (OpenRouter)...")
+        self.mode = "openrouter"
+        # … your existing OpenRouter logic …
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        model_name = os.getenv("OPENROUTER_MODEL_NAME")
+        if not api_key or not model_name:
+            logging.error("Missing OpenRouter credentials/model name.")
+            return
+        try:
+            self.openrouter_client = OpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=api_key,
+            )
+            self.openrouter_model_name = model_name
+            self.is_ready = True
+            logging.info(f"OpenRouter ready: {model_name}")
+        except Exception as e:
+            logging.error(f"OpenRouter init error: {e}", exc_info=True)
+
+    def _init_local_gguf(self):
+        logging.info("Initializing in PRODUCTION mode (Local GGUF)...")
+        self.mode = "local_gguf"
+        vram_before = torch.cuda.memory_allocated(0) if torch.cuda.is_available() else 0
+        logging.info(f"VRAM before main LLM load: {vram_before/1024**2:.1f} MiB")
+
+        if not torch.cuda.is_available():
+            logging.info("No GPU detected; loading GGUF on CPU.")
+            use_cpu = True
+        else:
+            use_cpu = os.getenv("LLM_USE_CPU", "false").lower() in ("true","1","t","y","yes")
+            if use_cpu:
+                logging.info("LLM_USE_CPU=true; loading GGUF on CPU.")
+        
+        # read GPU‐layers override (or fallback to old var for backward‐compat)
+        try:
+            raw = os.getenv("LLM_GPU_LAYERS",
+                            os.getenv("GGUF_N_GPU_LAYERS", "-1"))
+            n_gpu_layers = int(raw)
+        except ValueError:
+            n_gpu_layers = -1
+
+        if use_cpu:
+            n_gpu_layers = 0
+        elif not torch.cuda.is_available():
+            n_gpu_layers = 0
+        logging.info(f"GGUF n_gpu_layers={n_gpu_layers}")
+
+        # context length
+        try:
+            raw = os.getenv("LLM_N_CTX", os.getenv("GGUF_N_CTX", "2048"))
+            n_ctx = int(raw)
+        except ValueError:
+            n_ctx = 2048
+        logging.info(f"GGUF n_ctx={n_ctx}")
+
+        # model path
+        model_path = os.getenv("LOCAL_LLM_GGUF_MODEL_PATH")
+        if not model_path or not os.path.exists(model_path):
+            logging.error(f"LOCAL_LLM_GGUF_MODEL_PATH invalid: {model_path!r}")
+            return
+
+        # finally load
+        try:
+            logging.info(f"Loading GGUF model from: {model_path}")
+            self.local_model = Llama(
+                model_path=model_path,
+                n_gpu_layers=n_gpu_layers,
+                n_ctx=n_ctx,
+                verbose=False
+            )
+            self.is_ready = True
+            logging.info("Local GGUF model loaded successfully.")
+            vram_after = torch.cuda.memory_allocated(0) if torch.cuda.is_available() else 0
+            delta = (vram_after - vram_before) / (1024**2)
+            logging.info(f"VRAM after main LLM load: {vram_after/1024**2:.1f} MiB  (Δ {delta:.1f} MiB)")
+        except Exception as e:
+            logging.error(f"Failed to load GGUF: {e}", exc_info=True)
 
 
     def generate_response(self, prompt: str, max_tokens: int = 500, temperature: float = 0.7) -> str:

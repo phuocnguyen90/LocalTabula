@@ -36,32 +36,29 @@ route_query_structured: |
 
 # Base prompt for SQL generation
 generate_sql_base: |
-  You are an expert SQL generator.
-  
-  Given the following information:
-  
-  **Database Schema (in JSON format):**
-  {schema}
-  
-  **Data Sample (representative sample of the target table):**
-  {sample_data}
-  
-  **User Query:**
-  {user_query}
-  
-  **Augmented Keywords:**
-  {augmented_keywords}
-  
-  Generate an SQLite query to answer the user’s query. Follow these rules:
-  
-  1. Select either `*` or a combination of key and relevant value columns.
-  2. Use appropriate numerical comparisons (for example, write `COUNT < 5` instead of `COUNT < 5 units`).
-  3. When filtering textual fields, incorporate both the exact keyword(s) from the query and the additional augmented keywords (using the LIKE operator for partial matches). Note that SQLite does not support ILIKE; for case-insensitive matching use LOWER(column) LIKE LOWER('%keyword%').
-  4. Handle extremes such as min/max using subqueries (if needed) to include ties.
-  5. Avoid unnecessary clauses like ORDER BY or LIMIT unless they are required to answer the query.
-  6. Do not modify the database schema or data.
-  
-  **Respond ONLY with the complete SQLite query, ending with a semicolon.**
+  You are an expert SQL generator for SQLite.
+
+  **Inputs:**
+  - **schema** (JSON): {schema}
+  - **sample_data** (sample rows): {sample_data}
+  - **user_query**: {user_query}
+  - **augmented_keywords** (list): {augmented_keywords}
+
+  **Rules:**
+  1. Generate a valid SQLite query and end with a semicolon.
+  2. SELECT either `*` or only the columns needed to answer the question.
+  3. Use numeric comparisons without units (e.g. `COUNT < 5`).
+  4. For text filters, use `column LIKE '%keyword%' COLLATE NOCASE`.  
+     Group multiple keywords in an `OR` clause, e.g.:  
+     ```sql
+     WHERE (LOWER(col) LIKE '%kw1%' OR LOWER(col) LIKE '%kw2%')
+     ```
+  5. Handle MIN/MAX ties with subqueries if needed.
+  6. Avoid `ORDER BY` or `LIMIT` unless required.
+  7. Do not alter the schema or data.
+
+  **Output:** ONLY the SQL statement (no explanation, no markdown).
+
   
 
 # Addendum for SQL generation retries based on feedback
@@ -202,7 +199,11 @@ select_database_id: |
 
   **Available Databases (Schema Details & Sample Data Snippet):**
   ```json
-  {formatted_schemas_and_samples_str}
+  {schemas_json}
+  ```
+
+  **Available table names:** {db_id_list}
+  Please respond with exactly one of these values.
 
 
   ** User Query:** {user_query}
