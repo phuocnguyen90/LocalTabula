@@ -422,101 +422,97 @@ def _ensure_english_query(user_query: str, llm_wrapper: LLMWrapper) -> tuple[str
 def refine_and_select(
     user_query: str,
     conversation_history: Optional[list[dict]],
-    selected_db_schema: dict, # <-- Changed: Schema for the single selected DB {table_name: [cols]}
-    sample_data_str: Optional[str], # <-- Changed: Sample data string for the selected DB
+    selected_db_schema: dict,        # { table_name: [cols] }
+    sample_data_str: Optional[str],  # raw sample snippet or None
     llm_wrapper: LLMWrapper
 ) -> dict:
-    """ Refines query, gets keywords, determines route using the SINGLE selected DB's schema AND sample data. """
-    # Default fallback result
+    """ Refines query, picks route, and augments keywords for a single DB context. """
     default_result = {
         "refined_query": user_query,
-        "route": "SQL", # Default to SQL
+        "route": "SQL",
         "augmented_keywords": []
     }
+
+    # Quick bailouts
     if not llm_wrapper or not llm_wrapper.is_ready:
-        logging.warning("LLM wrapper not ready for refine/select/route. Using defaults.")
+        logging.warning("LLM not ready for refine_and_select; using defaults.")
         return default_result
     if not selected_db_schema:
-         logging.warning("No selected DB schema provided to refine_and_select. Using defaults.")
-         return default_result
-    if not PROMPTS or 'refine_and_select' not in PROMPTS:
-         logging.error("Prompt 'refine_and_select' not loaded.")
-         return default_result
+        logging.warning("No schema provided to refine_and_select; using defaults.")
+        return default_result
 
-    # Prepare context (history and sample data)
-    recent_context = "\n".join(f"{msg['role'].capitalize()}: {msg['content']}" for msg in conversation_history[-10:]) if conversation_history else "No previous conversation history."
-    formatted_schema = json.dumps(selected_db_schema, indent=2) # Schema for the selected DB only
-    sample_context = f"Sample Data Snippet:\n{sample_data_str}\n" if sample_data_str else "Sample data not available for this table.\n"
+    # 1) Fetch the template
+    template = PROMPTS.get("refine_and_select")
+    if template is None:
+        logging.error("Prompt 'refine_and_select' not found in PROMPTS.")
+        return default_result
 
+    # 2) Build the prompt inputs
+    recent_context = (
+        "\n".join(f"{m['role'].capitalize()}: {m['content']}"
+                  for m in (conversation_history or [])[-10:])
+        or "No conversation history."
+    )
+    schema_json = json.dumps(selected_db_schema, indent=2)
+    sample_context = (
+        f"Sample Data Snippet:\n{sample_data_str}"
+        if sample_data_str else
+        "Sample data not available."
+    )
+
+    # 3) Format the prompt, catching missing‐placeholder errors
     try:
-        prompt = PROMPTS['refine_and_select'].format(
+        prompt = template.format(
             recent_context=recent_context,
             user_query=user_query,
-            schema=formatted_schema, # Pass the selected schema
-            sample_data=sample_context # Pass the selected sample data
+            schema=schema_json,
+            sample_data=sample_context
         )
-        logging.debug(f"Sending refine_and_select prompt (single DB context)...")
-        prompt_preview = prompt[:500] + ("..." if len(prompt) > 500 else "")
-        logging.debug(f"Prompt Preview:\n{prompt_preview}")
-
-        # --- Generation and Parsing Logic ---
-        # Expecting JSON output: {"refined_query": "...", "route": "SQL/SEMANTIC", "augmented_keywords": ["kw1", "kw2"]}
-        raw_response_content = llm_wrapper.generate_response(prompt, max_tokens=350, temperature=0.2) # Allow more tokens for JSON
-        logging.debug(f"Raw LLM response for refine_and_select: {raw_response_content}")
-
-        # Clean potential markdown
-        cleaned_text = raw_response_content.strip()
-        if cleaned_text.startswith("```json"): cleaned_text = cleaned_text[7:]
-        if cleaned_text.startswith("```"): cleaned_text = cleaned_text[3:]
-        if cleaned_text.endswith("```"): cleaned_text = cleaned_text[:-3]
-        cleaned_text = cleaned_text.strip()
-
-        # Parse JSON
-        try:
-            response_data = json.loads(cleaned_text)
-            if not isinstance(response_data, dict):
-                 logging.error(f"Parsed refine/select JSON not dict: {cleaned_text} -> {type(response_data)}")
-                 return default_result
-        except json.JSONDecodeError as e:
-            logging.error(f"JSON parse failed for refine/select: {e}. Content: '{cleaned_text}'")
-            # Attempt fallback parsing if LLM just gave route
-            route_match = re.search(r'\b(SQL|SEMANTIC)\b', raw_response_content.upper())
-            if route_match:
-                logging.warning("Falling back to extracting route only from refine/select response.")
-                return {**default_result, "route": route_match.group(1)}
-            return default_result # Give up if no JSON and no clear route
-
-        # --- Robust Key Access & Validation ---
-        final_result = {}
-        expected_keys = ["refined_query", "augmented_keywords", "route"]
-        found_keys = {key.strip().strip('"'): value for key, value in response_data.items()} # Clean keys
-
-        for expected_key in expected_keys:
-            final_result[expected_key] = found_keys.get(expected_key, default_result.get(expected_key))
-            # Ensure correct types for keywords/route
-            if expected_key == "augmented_keywords" and not isinstance(final_result[expected_key], list):
-                 final_result[expected_key] = []
-            if expected_key == "route" and (not isinstance(final_result[expected_key], str) or final_result[expected_key].upper() not in ["SQL", "SEMANTIC"]):
-                 final_result[expected_key] = "SQL" # Default if invalid
-            elif expected_key == "route":
-                 final_result["route"] = final_result["route"].upper() # Standardize case
-
-        # Ensure keywords are strings
-        final_result["augmented_keywords"] = [str(item) for item in final_result.get("augmented_keywords", []) if item]
-
-        # Ensure refined query is a string
-        if not isinstance(final_result.get("refined_query"), str) or not final_result.get("refined_query"):
-            final_result["refined_query"] = default_result["refined_query"]
-
-        logging.info(f"Refine_and_select processed result: {final_result}")
-        return final_result
-
-    except KeyError:
-        logging.error("Prompt key 'refine_and_select' not found in prompts.yaml!")
+    except KeyError as e:
+        logging.error(
+            f"refine_and_select prompt is missing placeholder {e!r}. "
+            "Check your YAML template keys."
+        )
         return default_result
+
+    # 4) Call the LLM
+    raw = llm_wrapper.generate_response(prompt, max_tokens=350, temperature=0.2)
+    cleaned = raw.strip()
+    # strip code fences if present
+    for fence in ("```json", "```"):
+        if cleaned.startswith(fence):
+            cleaned = cleaned[len(fence):]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+    cleaned = cleaned.strip()
+
+    # 5) Parse JSON (with fallback)
+    try:
+        data = json.loads(cleaned)
+        if not isinstance(data, dict):
+            raise ValueError("Not a dict")
     except Exception as e:
-        logging.error(f"Unexpected error during refine_and_select LLM call: {e}", exc_info=True)
+        logging.error(f"Failed to parse refine_and_select JSON: {e}; raw='{cleaned}'")
+        # Try to extract just the route
+        m = re.search(r"\b(SQL|SEMANTIC)\b", raw.upper())
+        if m:
+            return {**default_result, "route": m.group(1)}
         return default_result
+
+    # 6) Build the final result with type checks
+    result = {
+        "refined_query": str(data.get("refined_query", user_query)) or user_query,
+        "route": data.get("route", "SQL").upper() if isinstance(data.get("route"), str) else "SQL",
+        "augmented_keywords": []
+    }
+    kws = data.get("augmented_keywords", [])
+    if isinstance(kws, list):
+        result["augmented_keywords"] = [str(k) for k in kws if k]
+    else:
+        logging.warning("refine_and_select returned non‐list for augmented_keywords; dropping it.")
+
+    logging.info(f"Refine_and_select result: {result}")
+    return result
 
 
 # <-- MODIFIED HELPER -->

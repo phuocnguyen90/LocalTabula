@@ -334,16 +334,23 @@ with tab_data_manage:
             qdrant_info = get_qdrant_collection_info(qdrant_client, collection_name ) if qdrant_ready else None
             
             # Display the collection name if found, else note as "Not Found"
-            collection_display = qdrant_info.get("collection_name") if qdrant_info else "Not Found"
+            collection_display = collection_name if qdrant_info else "Not Found"
+            points = qdrant_info.get("points_count") if qdrant_info else None
+            dim    = qdrant_info.get("vector_size")   if qdrant_info else None
             overview_data.append({
-                "Table Name": table_name,
-                "Columns": len(columns),
-                "SQLite Rows": row_count if row_count is not None else "N/A",
+                "Table Name":        table_name,
+                "Columns":           len(columns),
+                "SQLite Rows":       row_count if row_count is not None else "",
                 "Vector Collection": collection_display,
-                "Vector Points": qdrant_info.get("points_count", "N/A") if qdrant_info else "N/A",
-                "Vector Dim": qdrant_info.get("vector_size", "N/A") if qdrant_info else "N/A"
+                "Vector Points":     points,
+                "Vector Dim":        dim
             })
-        st.dataframe(pd.DataFrame(overview_data), use_container_width=True, hide_index=True)
+        df = pd.DataFrame(overview_data)
+        df["Vector Points"] = df["Vector Points"].astype("Int64")
+        df["Vector Dim"]    = df["Vector Dim"].astype("Int64")
+        st.dataframe(df, use_container_width=True, hide_index=True)\
+        
+
 
         # Detailed view per table
         with st.expander("Show Table Schema Details"):

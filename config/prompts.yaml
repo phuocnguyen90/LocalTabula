@@ -127,35 +127,18 @@ refine_and_select: |
   You are an expert data analyst assisting a user querying a database with potentially multiple tables. Your primary goal is to determine the correct table and the best way to query it based on the user's request and the available data structure.
 
   **Inputs:**
-  1. **Conversation History (Last few turns):**
-     {recent_context}
-  2. **User's Latest Query:** "{user_query}"
-  3. **Database Schema (Target Table and Columns):**
-     {schema}
-  4. **Sample Data (First few rows of a key table)):**
-      {sample_data}  
+  1. Conversation History: {recent_context}
+  2. User Query: "{user_query}"
+  3. Schema (JSON): {schema}
+  4. Sample Data: {sample_data}
 
-  **Analysis Steps & Output Instructions:**
-  Perform the following steps and structure your response as a single JSON object:
-
-  1. **Identify the Most Relevant Table:**
-     - Analyze the **User's Latest Query** and the **Conversation History**.
-     - Examine the **Database Schema**, paying close attention to the **column names** in each table.
-     - Determine which **single table** from the schema is most likely to contain the information needed to answer the query.
-     - **Output Key:** `"selected_table"`: string (The name of the single most relevant table.)
-
-  2. **Augment the Query with Additional Keywords:**
-     - Analyze the **User's Latest Query** to identify exact keywords provided by the user.
-     - Also determine one or more augmented keywords or phrases that are semantically related and might improve retrieval coverage.
-     - **Output Key:** `"augmented_keywords"`: list of strings (Additional keywords or phrases that complement the original query.)
-
-  3. **Determine the Query Route:**
-     - Based on the nature of the **Refined Query** and the likely data types in the **Selected Table’s** columns, decide whether to use an exact SQL query ('SQL') for structured retrieval or semantic search ('SEMANTIC') for unstructured text.
-     - **Output Key:** `"route"`: string ("SQL" or "SEMANTIC")
-
-  **Respond ONLY with a valid JSON object containing these keys.**
-  The JSON object should be structured as follows:
-  
+  **Output:**  
+  A single JSON object with keys:
+  - refined_query (string)  
+  - augmented_keywords (list of strings)  
+  - route ("SQL" or "SEMANTIC")
+  Respond ONLY with that JSON.
+ 
   **Example 1 (SQL Route):**
   ```json
   {
@@ -172,6 +155,7 @@ refine_and_select: |
       "augmented_keywords": ["lightweight", "portable", "travel", "laptop"],
       "route": "SEMANTIC"
   }
+  
 
     
 
