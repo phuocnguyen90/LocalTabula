@@ -208,15 +208,26 @@ def run_randomized_benchmark(
             # 2. Get sample data from the actual DB
             try:
                 with sqlite3.connect(temp_db_path) as temp_conn_sample:
-                    first_table_actual = next(iter(relevant_schemas.get(actual_db_id, {})), None)
+                    # a) Introspect tables from this DB
+                    actual_schema = get_schema_info(temp_conn_sample)
+                    first_table_actual = next(iter(actual_schema), None)
                     if first_table_actual:
-                        sample_data_str_actual = get_table_sample_data(temp_conn_sample, first_table_actual, limit=3)
+                        # b) Pull up to 3 real rows from that table
+                        sample_data_str_actual = get_table_sample_data(
+                            temp_conn_sample,
+                            first_table_actual,
+                            limit=3
+                        )
+                    else:
+                        sample_data_str_actual = None
                     if not sample_data_str_actual:
-                        logging.warning(f"Could not fetch sample data for DB '{actual_db_id}', table '{first_table_actual}'.")
-                        sample_data_str_actual = "N/A" # Use placeholder
+                        logging.warning(
+                            f"No sample data found for '{actual_db_id}' (table={first_table_actual})."
+                        )
+                        sample_data_str_actual = "N/A"
             except Exception as sample_err:
                 logging.error(f"Error getting sample data for '{actual_db_id}': {sample_err}")
-                sample_data_str_actual = f"Error: {sample_err}" # Pass error info
+                sample_data_str_actual = f"Error: {sample_err}"
 
             # --- Now temp_db_path points to the correctly setup DB for LATER execution ---
 
@@ -258,8 +269,9 @@ def run_randomized_benchmark(
             logging.info(f"LLM context schema size: {len(context_schemas_for_llm)} (Target size: {num_schema_subset})")
             logging.debug(f"Context DB IDs: {list(context_schemas_for_llm.keys())}")
             # --- End Schema Context Prep ---
+            conn_for_llm = sqlite3.connect(temp_db_path, timeout=10)
 
-            # --- 1. Run Analysis & Generation (conn=None) ---
+            # --- 1. Run Analysis & Generation ---
             try:
                 pipeline_time = None
                 gen_sql_exec_time = None
@@ -267,7 +279,7 @@ def run_randomized_benchmark(
                 start_time = time.time()
                 pipeline_result = process_natural_language_query(
                     original_query=example['question'],
-                    conn=None, # <--- Pass None here
+                    conn=conn_for_llm,
                     full_schema=context_schemas_for_llm, # <--- Use LLM context
                     llm_wrapper=llm_wrapper,
                     aux_models=aux_models,

@@ -48,16 +48,17 @@ generate_sql_base: |
   1. Generate a valid SQLite query and end with a semicolon.
   2. SELECT either `*` or only the columns needed to answer the question.
   3. Use numeric comparisons without units (e.g. `COUNT < 5`).
-  4. For text filters, use `column LIKE '%keyword%' COLLATE NOCASE`.  
-     Group multiple keywords in an `OR` clause, e.g.:  
-     ```sql
-     WHERE (LOWER(col) LIKE '%kw1%' OR LOWER(col) LIKE '%kw2%')
-     ```
-  5. Handle MIN/MAX ties with subqueries if needed.
-  6. Avoid `ORDER BY` or `LIMIT` unless required.
+  4. For text filter related requests, try to use augmented_keywords and use `column LIKE '%keyword%' COLLATE NOCASE`. Group multiple keywords in an `OR` clause, e.g.: 
+
+     WHERE (LOWER(col) LIKE '%keyword1%' OR LOWER(col) LIKE '%keyword2%')
+    
+  5. Resolve ties for MIN/MAX via subqueries or ORDER BY … LIMIT ….
+  6. Skip ORDER BY/LIMIT unless the question explicitly asks for “top N” or “first/last”.
   7. Do not alter the schema or data.
 
-  **Output:** ONLY the SQL statement (no explanation, no markdown).
+
+
+  **Output:** ONLY the SQL statement (no explanation, no commentary, no markdown).
 
   
 
@@ -132,12 +133,19 @@ refine_and_select: |
   3. Schema (JSON): {schema}
   4. Sample Data: {sample_data}
 
+  **Steps:**
+  1. Read the user’s question.  
+  2. Identify which table(s) and columns are needed.  
+  3. Rewrite the question into a **refined_query** that precisely names tables/columns and any filters, joins, aggregations, or sort orders.  
+  4. Extract any important search terms into **augmented_keywords**.  
+  5. Decide whether this should be handled via `"SQL"` or `"SEMANTIC"`.
+
   **Output:**  
-  A single JSON object with keys:
+  A single JSON object with exactly three keys:
   - refined_query (string)  
   - augmented_keywords (list of strings)  
   - route ("SQL" or "SEMANTIC")
-  Respond ONLY with that JSON.
+  Respond ONLY with that JSON object
  
     
 
@@ -164,10 +172,9 @@ select_database_id: |
   4. Respond ONLY with the single database ID string (the top-level key from the schema list) that is the best fit. Do not add any explanation.
 
   **Available Databases (Schema Details & Sample Data Snippet):**
-  ```json
+  
   {schemas_json}
-  ```
-
+  
   **Available table names:** {db_id_list}
   Please respond with exactly one of these values.
 
