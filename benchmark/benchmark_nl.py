@@ -9,17 +9,22 @@ import shutil
 import tempfile
 import random # Import random
 from typing import List, Dict, Any, Set, Tuple, Optional
+import sys, os
+
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 # --- Import necessary components from your existing utils ---
 try:
-    from utils import (
+    from utils.utils import (
         setup_environment, get_db_connection, init_qdrant_client, get_llm_wrapper,
         get_cached_aux_models, get_schema_info, get_table_sample_data,
         process_natural_language_query, # <--- Import the main pipeline function
         QDRANT_COLLECTION_PREFIX # If needed by dependencies, though not used directly here
     )
     # Import helper functions from the previous benchmark script (or define them here)
-    from benchmark import ( # Assuming benchmark.py exists in the same dir
+    from benchmark.benchmark_v2 import ( # Assuming benchmark.py exists in the same dir
          load_test_suite_questions, load_test_suite_gold_sql,
          combine_test_suite_data, setup_temp_database, # We'll use the version creating from SQL
          robust_execute_sql, compare_results
@@ -216,23 +221,29 @@ def run_randomized_benchmark(
             # --- Now temp_db_path points to the correctly setup DB for LATER execution ---
 
             # 3. Prepare schema context for LLM selection (including sample for GT)
-            context_schemas_for_llm = {}
-            if actual_db_id in relevant_schemas:
-                 pass
-            else:
-                 # This case should ideally not happen if dataset uses schemas correctly
-                 logging.error(f"Actual DB ID '{actual_db_id}' for sample {i+1} not found in loaded relevant schemas! Skipping.")
-                 analysis_errors += 1
-                 pipeline_status = "Analysis Failed (Actual Schema Missing)"
-                 # Append error result and continue
-                 results_summary.append({ ... }) # Populate with error details
-                 continue
+
+           
+            try:
+                with sqlite3.connect(temp_db_path) as conn_introspect:
+                   actual_schema = get_schema_info(conn_introspect)
+            except Exception as e:
+                logging.error(f"Failed to read schema from '{actual_db_id}.sqlite': {e}")
+                skipped_db += 1
+                pipeline_status = "DB Schema Introspection Failed"
+                continue
+
+            if not actual_schema:
+                logging.error(f"No tables found in actual DB '{actual_db_id}'! Skipping sample.")
+                skipped_db += 1
+                pipeline_status = "Empty DB Schema"
+                continue
+            # Build the LLM context: actual DB + (num_schema_subset-1) random distractors
+            context_schemas_for_llm = { actual_db_id: actual_schema }
+
 
             # 4. Add random distractors up to the desired context size
             num_distractors_needed = num_schema_subset - 1
-            context_schemas_for_llm = { 
-                 actual_db_id: relevant_schemas[actual_db_id]
-            }
+
             if num_distractors_needed > 0:
                  other_db_ids = [db for db in all_available_db_ids if db != actual_db_id]
                  # Select distractors, making sure not to request more than available
@@ -257,7 +268,7 @@ def run_randomized_benchmark(
                 pipeline_result = process_natural_language_query(
                     original_query=example['question'],
                     conn=None, # <--- Pass None here
-                    schema=context_schemas_for_llm, # Use the subset schemas
+                    full_schema=context_schemas_for_llm, # <--- Use LLM context
                     llm_wrapper=llm_wrapper,
                     aux_models=aux_models,
                     qdrant_client=qdrant_client,

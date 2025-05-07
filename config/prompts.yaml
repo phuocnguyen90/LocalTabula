@@ -139,24 +139,6 @@ refine_and_select: |
   - route ("SQL" or "SEMANTIC")
   Respond ONLY with that JSON.
  
-  **Example 1 (SQL Route):**
-  ```json
-  {
-      "refined_query": "Calculate the total sales amount for the product 'Laptop' in the month of June 2024.",
-      "augmented_keywords": ["Laptop", "sales total", "June 2024"],
-      "route": "SQL"
-  }
-  
-  **Example 2 (Semantic Route):**
-
-  ```json      
-  {
-      "refined_query": "Find products with descriptions similar to 'lightweight and portable laptop for travel'.",
-      "augmented_keywords": ["lightweight", "portable", "travel", "laptop"],
-      "route": "SEMANTIC"
-  }
-  
-
     
 
 # Prompt for generating the final natural language summary

@@ -517,7 +517,7 @@ def refine_and_select(
 
 # <-- MODIFIED HELPER -->
 def _generate_sql_query(
-    refined_query_input: str,
+    user_query: str,
     schema: dict, # <-- Changed: Schema for the single selected DB {table_name: [cols]}
     sample_data_str: Optional[str], # <-- Changed: Sample data string for selected DB
     aux_models,
@@ -538,7 +538,7 @@ def _generate_sql_query(
     prompt_context = {
         "schema": formatted_schema,
         "sample_data": sample_context,
-        "user_query": refined_query_input,
+        "user_query": user_query,
         "augmented_keywords": ", ".join(augmented_keywords) if augmented_keywords else "N/A" # Format keywords
     }
     prompt_parts = [PROMPTS['generate_sql_base'].format(**prompt_context)]
@@ -1014,9 +1014,9 @@ def _perform_semantic_search(user_query: str, aux_models: dict, qdrant_client: Q
 
 # <-- MODIFIED HELPER -->
 def execute_sql_pipeline(
-    refined_query: str,
-    selected_db_schema: dict, # Changed: Schema for the single selected DB
-    sample_data_str: Optional[str], # Changed: Sample string for the selected DB
+    user_query: str,
+    selected_db_schema: dict, 
+    sample_data_str: Optional[str], 
     aux_models,
     conn,
     llm_wrapper,
@@ -1039,7 +1039,7 @@ def execute_sql_pipeline(
     for attempt in range(max_retries + 1):
         logging.info(f"SQL Generation/Execution Attempt #{attempt + 1}")
         current_sql = _generate_sql_query(
-            refined_query_input=refined_query,
+            user_query=user_query,
             schema=selected_db_schema, # Pass the selected DB schema
             sample_data_str=sample_data_str, # Pass the selected DB sample
             aux_models=aux_models,
@@ -1062,7 +1062,7 @@ def execute_sql_pipeline(
             else: sql_result["sql_error"] = feedback; break # Max retries hit
 
         # Validate results using the refined query (which led to this SQL)
-        is_valid, validation_feedback = _validate_sql_results(refined_query, current_sql, sql_df, llm_wrapper)
+        is_valid, validation_feedback = _validate_sql_results(user_query, current_sql, sql_df, llm_wrapper)
         if is_valid:
             sql_result["sql_success"] = True; sql_result["sql_data"] = sql_df; sql_result["sql_error"] = None
             logging.info("SQL attempt successful and validated.")
@@ -1096,7 +1096,7 @@ def execute_semantic_pipeline(
 
 # <-- MODIFIED HELPER -->
 def run_secondary_route(
-    english_query: str,
+    user_query: str,
     primary_route: str,
     sql_result: dict, # Result from primary SQL attempt
     semantic_result: dict, # Result from primary Semantic attempt
@@ -1116,7 +1116,7 @@ def run_secondary_route(
     if primary_sql_failed:
         logging.info("Primary SQL failed/empty, running secondary Semantic search...")
         # Execute semantic pipeline as secondary
-        sec_semantic_result = execute_semantic_pipeline(english_query, aux_models, qdrant_client)
+        sec_semantic_result = execute_semantic_pipeline(user_query, aux_models, qdrant_client)
         # Update semantic_result only if the secondary attempt was successful
         if sec_semantic_result.get("semantic_success"):
             semantic_result = sec_semantic_result # Replace primary result
@@ -1125,7 +1125,7 @@ def run_secondary_route(
         logging.info("Primary Semantic failed/empty, running secondary SQL generation/execution...")
         # Execute SQL pipeline as secondary (only 1 attempt, no retry loop here)
         sec_sql_result = execute_sql_pipeline(
-            refined_query=english_query, # Use the same refined query
+            user_query=user_query, 
             selected_db_schema=selected_db_schema,
             sample_data_str=selected_db_sample,
             aux_models=aux_models,
@@ -1303,7 +1303,7 @@ def process_natural_language_query(
         start_time_gen_sql = time.perf_counter()
         logging.info("Generating SQL Query...")
         generated_sql = _generate_sql_query(
-            refined_query_input=result["refined_query"],
+            user_query=result["refined_query"],
             schema=selected_db_schema, # Pass selected schema
             sample_data_str=selected_db_sample, # Pass selected sample
             aux_models=aux_models,
@@ -1354,7 +1354,7 @@ def process_natural_language_query(
     # Execute primary route
     if result["determined_route"] == "SQL":
         sql_result_dict = execute_sql_pipeline(
-            refined_query=result["refined_query"],
+            user_query=result["refined_query"],
             selected_db_schema=selected_db_schema,
             sample_data_str=selected_db_sample,
             aux_models=aux_models,

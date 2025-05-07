@@ -7,83 +7,75 @@ import logging
 import time
 import shutil
 import tempfile
-from typing import List, Dict, Any, Set, Tuple, Optional
-try:
-    from utils.utils import (
-    setup_environment, get_db_connection, init_qdrant_client, get_llm_wrapper,
-    get_cached_aux_models, get_schema_info, _generate_sql_query, # Use the core generator
-    # We need a way to execute SQL and get results robustly for comparison
-    )
+import random
+from typing import List, Dict, Any, Optional, Set, Tuple
+import sys, os
 
-except ImportError as e:
-    print(f"Error importing from utils: {e}")
-    print("Please ensure benchmark.py is in the correct directory relative to utils.py")
-    exit(1)
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from utils.utils import (
+    setup_environment, get_db_connection, init_qdrant_client, get_llm_wrapper,
+    get_cached_aux_models, get_schema_info, _generate_sql_query
+)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(funcName)s] %(message)s')
 
-# --- Helper Functions ---
 
 def load_test_suite_questions(filepath: str) -> List[Dict[str, Any]]:
-    """Loads the questions and db_ids from the test suite JSON file."""
-    try:
-        with open(filepath, 'r') as f:
-            data = json.load(f)
-            logging.info(f"Loaded {len(data)} questions/db_ids from {filepath}")
-            # Add an index to preserve order for matching with gold SQL
-            for i, item in enumerate(data):
-                item['original_index'] = i
-        return data
-    except FileNotFoundError:
-        logging.error(f"Test suite questions file not found: {filepath}")
-        return []
-    except json.JSONDecodeError:
-        logging.error(f"Failed to decode JSON from file: {filepath}")
-        return []
+    with open(filepath, 'r') as f:
+        data = json.load(f)
+        for i, item in enumerate(data):
+            item['original_index'] = i
+    logging.info(f"Loaded {len(data)} questions from {filepath}")
+    return data
+
 
 def load_test_suite_gold_sql(filepath: str) -> List[str]:
-    """Loads the gold SQL queries from the .sql file (one per line)."""
-    try:
-        with open(filepath, 'r') as f:
-            # Read lines, strip whitespace, and filter empty lines
-            gold_queries = [line.strip() for line in f if line.strip()]
-            logging.info(f"Loaded {len(gold_queries)} gold SQL queries from {filepath}")
-        return gold_queries
-    except FileNotFoundError:
-        logging.error(f"Gold SQL file not found: {filepath}")   
-    return []
+    with open(filepath, 'r') as f:
+        gold = [line.strip().split('\t',1)[0] for line in f if line.strip()]
+    logging.info(f"Loaded {len(gold)} gold SQL queries from {filepath}")
+    return gold
 
 
-
-def combine_test_suite_data(questions_data: List[Dict[str, Any]], gold_queries: List[str]) -> List[Dict[str, Any]]:
-    """Combines question data with gold queries based on order."""
-    if len(questions_data) != len(gold_queries):
-        logging.error(f"Mismatch questions ({len(questions_data)}) vs gold queries ({len(gold_queries)}).")
+def combine_test_suite_data(questions, gold_queries):
+    if len(questions) != len(gold_queries):
+        logging.error("Mismatch between questions and gold queries count.")
         return []
-
-    combined_data = []
-    for i, question_item in enumerate(questions_data):
-        gold_sql = gold_queries[i]
-        actual_gold_sql = gold_sql.split('\t', 1)[0].strip() if '\t' in gold_sql else gold_sql
-        question_item['query'] = actual_gold_sql
-        combined_data.append(question_item)
-    logging.info(f"Successfully combined {len(combined_data)} test examples.")
-    return combined_data
+    for i, q in enumerate(questions):
+        q['query'] = gold_queries[i]
+    return questions
 
 
-def load_dataset(filepath: str) -> List[Dict[str, Any]]:
-    """Loads the NL-to-SQL dataset from a JSON file."""
-    try:
-        with open(filepath, 'r') as f:
-            data = json.load(f)
-        logging.info(f"Loaded {len(data)} examples from {filepath}")
-        return data
-    except FileNotFoundError:
-        logging.error(f"Dataset file not found: {filepath}")
-        return []
-    except json.JSONDecodeError:
-        logging.error(f"Failed to decode JSON from file: {filepath}")
-        return []
+def prepare_sample_and_schema(
+    dataset: List[Dict[str, Any]],
+    test_db_dir: str,
+    num_samples: int = 20
+) -> Tuple[List[Dict[str, Any]], str]:
+    """
+    1. Randomly sample `num_samples` examples from the full dataset.
+    2. Collect the unique db_ids of those samples.
+    3. Copy only those db_id folders (with .sqlite or schema.sql) into a temp directory.
+    Returns the sampled examples and the temp db directory path.
+    """
+    # 1. Sample examples
+    sampled = random.sample(dataset, k=num_samples)
+
+    # 2. Unique DB IDs
+    db_ids: Set[str] = {ex['db_id'] for ex in sampled}
+    logging.info(f"Sampling {num_samples} examples across {len(db_ids)} distinct DBs: {db_ids}")
+
+    # 3. Create subset directory
+    subset_dir = tempfile.mkdtemp(prefix='spider_subset_')
+    for db_id in db_ids:
+        src_folder = os.path.join(test_db_dir, db_id)
+        if not os.path.isdir(src_folder):
+            logging.warning(f"DB folder not found for sampling: {src_folder}")
+            continue
+        dst_folder = os.path.join(subset_dir, db_id)
+        shutil.copytree(src_folder, dst_folder)
+    return sampled, subset_dir
 
 def create_db_from_sql_script(script_path: str, db_path: str) -> bool:
     """Creates and populates an SQLite database from a .sql script."""
@@ -107,6 +99,7 @@ def create_db_from_sql_script(script_path: str, db_path: str) -> bool:
         logging.error(f"Unexpected error creating db from script '{script_path}': {e}")
         if os.path.exists(db_path): os.remove(db_path)
         return False
+
 
 def setup_temp_database(db_id: str, db_base_dir: str, temp_dir: str) -> Optional[str]:
     """
@@ -256,7 +249,7 @@ def compare_results(gold_results: Optional[Set[Tuple]], gen_results: Optional[Se
         return False
     # Strict equality check between the two sets
     return gold_results == gen_results
-    
+
 def run_benchmark(dataset: List[Dict[str, Any]], db_dir: str, llm_wrapper, aux_models, limit: Optional[int] = None):
     """
     Runs the benchmark evaluation loop.
@@ -309,6 +302,7 @@ def run_benchmark(dataset: List[Dict[str, Any]], db_dir: str, llm_wrapper, aux_m
             gold_error = None
             exec_success = False
             match_success = False
+            match_success_bool = False
             status = "Processing"
             schema = None # Initialize schema
             match_details = None # Store detailed diff if match fails
@@ -459,55 +453,60 @@ def run_benchmark(dataset: List[Dict[str, Any]], db_dir: str, llm_wrapper, aux_m
 
     return results_summary, exec_accuracy, match_accuracy
 
-
 def main():
     parser = argparse.ArgumentParser(description="Benchmark NL-to-SQL generation using Spider Test Suite format.")
-    # Arguments specific to Test Suite
-    parser.add_argument("test_suite_file", help="Path to the test suite JSON file (e.g., test.json).")
-    parser.add_argument("gold_sql_file", help="Path to the corresponding gold SQL file (e.g., test_gold.sql).")
-    parser.add_argument("test_database_dir", help="Path to the directory containing TEST database folders (e.g., 'test_database/'). Should contain db_id subfolders with schema.sql.")
-    # General arguments
-    parser.add_argument("--limit", type=int, default=None, help="Limit the number of examples to process.")
-    parser.add_argument("--results_out", default="benchmark_test_suite_results.json", help="Path to save detailed benchmark results.")
-    parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Set the logging level.")
-
+    parser.add_argument("test_suite_file", help="Path to test suite JSON file.")
+    parser.add_argument("gold_sql_file", help="Path to gold SQL file.")
+    parser.add_argument("test_database_dir", help="Path to full Spider test_database directory.")
+    parser.add_argument("--samples", type=int, default=20, help="Number of examples to sample.")
+    parser.add_argument("--results_out", default="benchmark_results.json")
+    parser.add_argument("--log_level", default="INFO", choices=["DEBUG","INFO","WARNING","ERROR"])
     args = parser.parse_args()
 
     logging.getLogger().setLevel(args.log_level.upper())
-    logging.info(f"Logging level set to {args.log_level.upper()}")
+    logging.info(f"Log level set to {args.log_level.upper()}")
 
-    logging.info("Initializing LLM Wrapper and Auxiliary Models...")
+    # Load models
     llm_wrapper = get_llm_wrapper()
-    aux_models = get_cached_aux_models()
-    logging.info("Initialization complete.")
+    aux_models   = get_cached_aux_models()
+    logging.info("Models initialized.")
 
-    questions_data = load_test_suite_questions(args.test_suite_file)
-    gold_queries = load_test_suite_gold_sql(args.gold_sql_file)
-    if not questions_data or not gold_queries: exit(1)
+    # Load test suite
+    questions = load_test_suite_questions(args.test_suite_file)
+    gold_sql   = load_test_suite_gold_sql(args.gold_sql_file)
+    dataset    = combine_test_suite_data(questions, gold_sql)
+    if not dataset:
+        logging.error("No data to benchmark. Exiting.")
+        return
 
-    dataset = combine_test_suite_data(questions_data, gold_queries)
-    if not dataset: exit(1)
+    # Prepare samples + subset DB dir
+    sampled_data, subset_db_dir = prepare_sample_and_schema(
+        dataset, args.test_database_dir, num_samples=args.samples
+    )
 
-    # --- Pass the specific test_database_dir to run_benchmark ---
+    # Run benchmark on the sampled subset
     results, exec_acc, match_acc = run_benchmark(
-        dataset=dataset,
-        db_dir=args.test_database_dir, # Use the test database directory path
+        dataset=sampled_data,
+        db_dir=subset_db_dir,
         llm_wrapper=llm_wrapper,
         aux_models=aux_models,
-        limit=args.limit
+        limit=None
     )
-    # ---
 
-    if results:
-        try:
-            output_results = [{k: v for k, v in item.items()} for item in results]
-            with open(args.results_out, 'w') as f:
-                json.dump(output_results, f, indent=2)
-            logging.info(f"Detailed results saved to {args.results_out}")
-        except Exception as e:
-            logging.error(f"Failed to save results to {args.results_out}: {e}")
-
-    logging.info("Benchmarking finished.")
+    # Save results
+    with open(args.results_out, 'w') as f:
+        json.dump(results, f, indent=2)
+    logging.info(f"Saved detailed results to {args.results_out}")
+    logging.info(f"Execution Acc: {exec_acc:.2f}%, Match Acc: {match_acc:.2f}%")
 
 if __name__ == "__main__":
     main()
+
+# python benchmark/benchmark_v2.py app_data/spider_data/spider_data/test.json app_data/spider_data/spider_data/test_gold.sql app_data/spider_data/spider_data/test_database/ --samples 20 --results_out spider_test_results.json --log_level INFO   
+# python benchmark_v2.py \
+#       app_data/spider_data/spider_data/test.json \
+#       app_data/spider_data/spider_data/test_gold.sql \
+#       app_data/spider_data/spider_data/test_database/ \
+#       --samples 20 \
+#       --results_out spider_test_results.json \
+#       --log_level INFO  
