@@ -544,11 +544,36 @@ def _generate_sql_query(
     prompt_parts = [PROMPTS['generate_sql_base'].format(**prompt_context)]
 
     if previous_sql and feedback:
-        if "syntax error" in feedback.lower():
-            prompt_parts.append(PROMPTS['generate_sql_feedback_syntax'].format(previous_sql=previous_sql, feedback=feedback))
-        else:
-            prompt_parts.append(PROMPTS['generate_sql_feedback_other'].format(previous_sql=previous_sql, feedback=feedback))
-    prompt_parts.append(PROMPTS['generate_sql_response_format'])
+        # Frame the feedback as direct guidance for the SQL LLM's next attempt
+        feedback_header = "IMPORTANT GUIDANCE FOR YOUR NEXT SQL GENERATION ATTEMPT:\n" \
+                        "A previous attempt to generate SQL for this request resulted in an issue.\n" \
+                        "Please carefully analyze the following information and generate a corrected SQL query.\n"
+        prompt_parts.append(feedback_header)
+
+        if "syntax error" in feedback.lower(): # Or other specific error checks you might add
+            # For syntax errors, the focus is on correcting the provided SQL
+            prompt_parts.append(PROMPTS['generate_sql_feedback_syntax_correction'].format(
+                previous_sql=previous_sql, 
+                error_message=feedback # Pass the raw error as 'error_message'
+            ))
+        elif "no such table" in feedback.lower() or "no such column" in feedback.lower():
+            # For schema-related errors, re-emphasize using the provided schema and highlight the issue
+            prompt_parts.append(PROMPTS['generate_sql_feedback_schema_issue'].format(
+                previous_sql=previous_sql,
+                error_message=feedback,
+                # We might need to pass schema_json and sample_data again here if they are not sticky enough
+                # from the base prompt, or trust the LLM remembers it from generate_sql_base.
+                # For now, let's assume the base prompt's schema is still in its "attention".
+                # The key is to point out *what kind* of error it was.
+                schema_context_reminder="Remember to strictly adhere to the tables and columns defined in the provided database schema."
+            ))
+        else: # General "other" errors (e.g., validation failure from general LLM)
+            prompt_parts.append(PROMPTS['generate_sql_feedback_other_improvement'].format(
+                previous_sql=previous_sql, 
+                reason_for_improvement=feedback # 'feedback' here might be "results not satisfactory"
+            ))
+
+    prompt_parts.append(PROMPTS['generate_sql_response_format']) # "SQL Query:"
     prompt = "\n".join(prompt_parts)
     # --- End Prompt Construction ---
 
@@ -1205,7 +1230,9 @@ def process_natural_language_query(
     full_schema: dict, # Expects {db_id: [cols], ...} or {table_name: [cols], ...}
     llm_wrapper, aux_models, qdrant_client, max_retries: int = 1,
     conversation_history: Optional[list] = None,
-    pre_selected_db_id: Optional[str] = None # Optional: Force use of a specific db_id/table
+    db_samples_for_selection: Optional[Dict[str, str]] = None, # New: {db_id: "concatenated_sample_str_for_db_id"}
+    pre_selected_db_id: Optional[str] = None, # Optional: Force use of a specific db_id/table
+    semantic_search: Optional[bool] = False
 ) -> dict:
     """
     Main pipeline for processing NL queries against multiple potential DBs/tables.
@@ -1217,14 +1244,21 @@ def process_natural_language_query(
     """
     # --- Initial Checks ---
     start_time_total = time.perf_counter()
-    result = { "status": "processing", "message": "Starting query processing...", "query_was_translated": False, "processed_query": original_query, "selected_db_id": None, "refined_query": None, "augmented_keywords": [], "determined_route": None, "generated_sql": None, "sql_success": False, "sql_data": None, "sql_error": None, "semantic_success": False, "semantic_data": None, "semantic_error": None, "natural_language_summary": None, "raw_display_data": None, "timing": {} }
+    result = {
+        "status": "processing", "message": "Starting query processing...",
+        "query_was_translated": False, "processed_query": original_query,
+        "selected_db_id": None, "refined_query": None, "augmented_keywords": [],
+        "determined_route": None, "generated_sql": None,
+        "sql_success": False, "sql_data": None, "sql_error": None,
+        "semantic_success": False, "semantic_data": None, "semantic_error": None,
+        "natural_language_summary": None, "raw_display_data": None, "timing": {}
+    }
 
-    if not llm_wrapper or not llm_wrapper.is_ready: return {**result, "status": "error", "message": "LLM wrapper not ready."}
-    if not aux_models or aux_models.get('status') != 'loaded': return {**result, "status": "error", "message": "Auxiliary models not ready."}
-    if not qdrant_client: logging.warning("Qdrant client not ready, semantic search unavailable.") # Non-fatal if SQL route chosen
+    # ... (Initial Checks remain the same) ...
     if not full_schema: return {**result, "status": "error", "message": "No database schema provided."}
-    available_db_ids = list(full_schema.keys())
-    if not available_db_ids: return {**result, "status": "error", "message": "Schema dictionary is empty."}
+    available_db_ids_from_full_schema = list(full_schema.keys()) # These are the DB_IDs in context
+    if not available_db_ids_from_full_schema: return {**result, "status": "error", "message": "Schema dictionary is empty."}
+
 
     # --- 1. Language Check ---
     start_time_lang = time.perf_counter()
@@ -1235,190 +1269,303 @@ def process_natural_language_query(
 
     # --- 2. Select Database ID ---
     start_time_select = time.perf_counter()
-    selected_db_id = None
-    db_samples = {} # Store samples for each potential DB ID
+    selected_db_id_by_llm = None # LLM's choice of DB
+    sample_data_for_sql_gen = "Sample data not available for the selected DB for SQL generation." # Default
+
     if pre_selected_db_id and pre_selected_db_id in full_schema:
-        selected_db_id = pre_selected_db_id
-        logging.info(f"Using pre-selected DB ID: {selected_db_id}")
-        # Still need sample for the pre-selected one if executing later
-        if conn: db_samples[selected_db_id] = get_table_sample_data(conn, selected_db_id, limit=3)
+        selected_db_id_by_llm = pre_selected_db_id
+        logging.info(f"Using pre-selected DB ID: {selected_db_id_by_llm}")
+        if db_samples_for_selection and selected_db_id_by_llm in db_samples_for_selection:
+            sample_data_for_sql_gen = db_samples_for_selection[selected_db_id_by_llm]
+        elif conn: # Fallback: try to get sample using conn if it's for this pre_selected_db_id
+            logging.warning(f"Samples for pre-selected DB '{selected_db_id_by_llm}' not in db_samples_for_selection. Attempting fetch with 'conn'.")
+            current_db_schema_dict = full_schema.get(selected_db_id_by_llm)
+            if current_db_schema_dict:
+                # Re-using _get_multi_table_sample_str logic concept
+                s_parts = []
+                tables_to_sample = list(current_db_schema_dict.keys())[:3]
+                for t_name in tables_to_sample:
+                    s_data = get_table_sample_data(conn, t_name, limit=2)
+                    if s_data and "Error" not in s_data: s_parts.append(f"-- Sample rows from table {t_name}\n{s_data}")
+                if s_parts: sample_data_for_sql_gen = "\n\n".join(s_parts)
     else:
         logging.info("Attempting to select relevant Database ID (Table)...")
-        if not conn:
-             logging.warning("DB connection is None, cannot fetch samples for DB selection. Selection accuracy may be reduced.")
+        
+        effective_db_samples_for_select_prompt = {}
+        if db_samples_for_selection:
+            logging.info(f"Received db_samples_for_selection with {len(db_samples_for_selection)} entries.") # ADD DEBUG
+            effective_db_samples_for_select_prompt = db_samples_for_selection
+            # Ensure samples only for DBs present in full_schema to avoid issues
+            effective_db_samples_for_select_prompt = {
+                k: v for k, v in effective_db_samples_for_select_prompt.items() if k in full_schema
+            }
+            if not effective_db_samples_for_select_prompt:
+                logging.warning("`db_samples_for_selection` was filtered to empty after checking against `full_schema` keys.")
         else:
-             # Fetch samples for all DBs for the selection prompt
-             logging.info(f"Fetching samples for {len(available_db_ids)} DB IDs...")
-             for db_id in available_db_ids:
-                 db_samples[db_id] = get_table_sample_data(conn, db_id, limit=3)
+            logging.warning("`db_samples_for_selection` not provided to `process_natural_language_query`. Sample quality for DB selection might be reduced.")
+            # LLM will select based on schemas only if samples are missing.
 
         # Format context (schemas + samples) for the selection prompt
-        schema_and_samples, truncated = format_context_for_db_selection(
-                full_schema,     # your {db_id: [cols], …}
-                db_samples,      # your {db_id: sample_str, …}
-                max_entries=5    # e.g. if you only want the top 5
-            )
+        # full_schema is {db_id: {table:cols}, ...}
+        # format_context_for_db_selection expects {db_id: [cols]} for its `available_schemas`
+        # We need to adapt or pass a simplified schema view for selection if it expects flat [cols] per db_id.
+        # The current `format_context_for_db_selection` takes {db_id: {"columns": [cols], "sample": str}} which is fine.
+        # It seems `select_database_id` expects `schemas_json` to be string dump of this.
+        # `full_schema` is already structured as {db_id: schema_dict_for_db_id}.
+        # `format_context_for_db_selection` is more about formatting a string.
+        # `select_database_id` takes `schema_and_samples` (a dict) and `available_db_ids`.
+        # Let's construct `schema_and_samples_for_select_prompt` directly for `select_database_id`
+        
+        schema_and_samples_for_select_prompt_dict = {}
+        for db_id_key, single_db_schema_val in full_schema.items():
+            # single_db_schema_val is {table_name: [cols], ...}
+            # We need to represent this in a way `select_database_id` prompt understands.
+            # The prompt `select_database_id` expects `schemas_json` which is a dump of
+            # { db_id: { "columns": [col1, col2, ...], "sample_data_snippet": str|None }, ... }
+            # The "columns" here should ideally be a representation of all tables and columns.
+            
+            # Let's simplify: the prompt for `select_database_id` likely just wants a string representation
+            # of the schema for each db_id.
+            
+            # The `format_context_for_db_selection` creates this structure from a simpler input.
+            # Let's use it as intended:
+            # `available_schemas_for_formatter = {db_id: list_of_all_cols_in_db_id_for_simplicity}`
+            # Or, `available_schemas_for_formatter = full_schema` if format_context understands it.
+            # Looking at format_context_for_db_selection, it expects `available_schemas: Dict[str, List[str]]`
+            # which means db_id -> list of columns (flat, not per table). This might be a simplification in that helper.
+            
+            # For now, let's assume `select_database_id`'s prompt handles `schemas_json` derived from
+            # `full_schema` (which is `{db_id: {table:cols}}`) and `effective_db_samples_for_select_prompt`.
+            # The prompt might iterate `db_id: schema_info_dict` from `schemas_json`.
+            # Let's build what `select_database_id` expects for its `schema_and_samples` argument.
+            db_context_for_selection = {}
+            for db_id_sel, schema_dict_sel in full_schema.items():
+                # Create a string summary of tables and columns for "columns" field
+                col_summary_parts = []
+                for table_n, table_c in schema_dict_sel.items():
+                    col_summary_parts.append(f"Table {table_n}: {', '.join(table_c)}")
+                db_context_for_selection[db_id_sel] = {
+                    "schema_summary": "; ".join(col_summary_parts), # Or just pass schema_dict_sel
+                    "tables_and_columns": schema_dict_sel, # More structured
+                    "sample_data_snippet": effective_db_samples_for_select_prompt.get(db_id_sel, "N/A")
+                }
 
-        selected_db_id = select_database_id(
-            processed_query,
-            schema_and_samples,
-            list(full_schema), # Pass original full list for validation
-            llm_wrapper,
-            conversation_history
+        selected_db_id_by_llm = select_database_id(
+            user_query=processed_query,
+            schema_and_samples=db_context_for_selection, # Pass the constructed context
+            available_db_ids=available_db_ids_from_full_schema, # Pass original full list for validation
+            llm_wrapper=llm_wrapper,
+            conversation_history=conversation_history
         )
+        
+        # After LLM selects a DB, get its specific sample for SQL generation
+        if selected_db_id_by_llm and db_samples_for_selection and selected_db_id_by_llm in db_samples_for_selection:
+            sample_data_for_sql_gen = db_samples_for_selection[selected_db_id_by_llm]
+        elif selected_db_id_by_llm:
+            logging.warning(f"Sample for LLM-selected DB '{selected_db_id_by_llm}' not in db_samples_for_selection map (keys: {list(db_samples_for_selection.keys() if db_samples_for_selection else [])}).")
+            # Fallback to trying with `conn` if it's for this selected DB (benchmark case)
+            if conn:
+                current_db_schema_dict = full_schema.get(selected_db_id_by_llm)
+                if current_db_schema_dict:
+                    logging.info(f"Attempting to fetch sample for '{selected_db_id_by_llm}' using provided 'conn'.")
+                    s_parts_fallback = []
+                    tables_to_sample_fb = list(current_db_schema_dict.keys())[:3]
+                    for t_name_fb in tables_to_sample_fb:
+                        s_data_fb = get_table_sample_data(conn, t_name_fb, limit=2) # This might fail if conn is not for selected_db_id_by_llm
+                        if s_data_fb and "Error" not in s_data_fb: s_parts_fallback.append(f"-- Sample rows from table {t_name_fb}\n{s_data_fb}")
+                    if s_parts_fallback: sample_data_for_sql_gen = "\n\n".join(s_parts_fallback)
+
 
     result["timing"]["db_selection"] = time.perf_counter() - start_time_select
 
-    if not selected_db_id:
-        msg = "Could not determine the relevant table/database for your query."
+    if not selected_db_id_by_llm:
+        msg = "Could not determine the relevant table/database for your query via LLM selection."
         logging.error(msg)
-        return {**result, "status": "error", "message": msg}
+        # If running in a benchmark where a correct DB exists, this is an error.
+        # If running live, might offer general search or ask for clarification.
+        return {**result, "status": "error_db_selection", "message": msg, "timing": {**result["timing"], "total": time.perf_counter() - start_time_total}}
 
-    result["selected_db_id"] = selected_db_id
-    selected_db_schema = {selected_db_id: full_schema[selected_db_id]} # Get schema for selected only
-    selected_db_sample = db_samples.get(selected_db_id) # Get sample for selected only (might be None if conn was None)
-    logging.info(f"Selected DB ID: {selected_db_id}")
+    result["selected_db_id"] = selected_db_id_by_llm
+    # Schema for the LLM-selected DB, for SQL generation
+    schema_for_selected_db_sql_gen = {selected_db_id_by_llm: full_schema[selected_db_id_by_llm]}
+    logging.info(f"LLM Selected DB ID: {selected_db_id_by_llm}")
+    logging.debug(f"Sample for SQL Gen for '{selected_db_id_by_llm}':\n{sample_data_for_sql_gen[:300]}...")
 
     # --- 3. Refine Query & Determine Route (using selected context) ---
     start_time_refine = time.perf_counter()
     refinement_data = refine_and_select(
-        processed_query,
-        conversation_history,
-        selected_db_schema, # Pass only selected schema
-        selected_db_sample, # Pass only selected sample
+        user_query=processed_query, # Use language-processed query
+        conversation_history=conversation_history,
+        selected_db_schema=schema_for_selected_db_sql_gen, # Schema of the DB chosen by LLM
+        sample_data_str=sample_data_for_sql_gen,           # Sample from the DB chosen by LLM
         llm_wrapper=llm_wrapper,
     )
     result["timing"]["refine_route"] = time.perf_counter() - start_time_refine
 
     result["refined_query"] = refinement_data.get("refined_query", processed_query)
-    result["determined_route"] = refinement_data.get("route", "SQL").upper() # Default to SQL
+    result["determined_route"] = refinement_data.get("route", "SQL").upper()
     result["augmented_keywords"] = refinement_data.get("augmented_keywords", [])
     logging.info(f"Refined Query='{result['refined_query']}', Route='{result['determined_route']}', Keywords={result['augmented_keywords']}")
 
     # --- 4. Generate SQL (if route is SQL) ---
-    sql_result_dict = { "sql_success": False, "generated_sql": None, "sql_data": None, "sql_error": None } # Store SQL specific results
-    semantic_result_dict = { "semantic_success": False, "semantic_data": None, "semantic_error": None } # Store Semantic specific results
+    # Initialize results dicts for SQL and Semantic parts
+    sql_pipeline_outcome = { "sql_success": False, "generated_sql": None, "sql_data": None, "sql_error": None }
+    semantic_pipeline_outcome = { "semantic_success": False, "semantic_data": None, "semantic_error": None }
+
 
     if result["determined_route"] == "SQL":
         start_time_gen_sql = time.perf_counter()
-        logging.info("Generating SQL Query...")
-        generated_sql = _generate_sql_query(
+        logging.info("Pipeline: Generating SQL Query...")
+        # _generate_sql_query is called within execute_sql_pipeline, so no direct call here needed if using the full pipeline.
+        # However, for benchmark_nl.py, we need generated_sql even if conn is None or if execution fails.
+        # So, we might need a distinct generation step.
+        # The current `process_natural_language_query` was structured to generate SQL first, then execute.
+        
+        # Let's keep the structure: generate SQL first, then decide on execution.
+        # This `generated_sql_string` is the attempt before any retries from `execute_sql_pipeline`.
+        generated_sql_string = _generate_sql_query(
             user_query=result["refined_query"],
-            schema=selected_db_schema, # Pass selected schema
-            sample_data_str=selected_db_sample, # Pass selected sample
+            schema=schema_for_selected_db_sql_gen,
+            sample_data_str=sample_data_for_sql_gen,
             aux_models=aux_models,
             augmented_keywords=result["augmented_keywords"]
         )
-        sql_result_dict["generated_sql"] = generated_sql # Store generated SQL or error string
+        sql_pipeline_outcome["generated_sql"] = generated_sql_string # Store initial generation attempt
+        result["generated_sql"] = generated_sql_string # Update main result dict
         result["timing"]["sql_generation"] = time.perf_counter() - start_time_gen_sql
 
-        if generated_sql.startswith("-- Error"):
-             msg = f"SQL Generation Failed: {generated_sql}"
-             logging.error(msg)
-             # Update main result dict and return early if only analysis was requested
-             result.update({"status": "error_sql_generation", "message": msg, "generated_sql": generated_sql})
-             result["timing"]["total"] = time.perf_counter() - start_time_total
-             return result
+        if generated_sql_string.startswith("-- Error"):
+            msg = f"SQL Generation Failed (Initial Attempt): {generated_sql_string}"
+            logging.error(msg)
+            result.update({"status": "error_sql_generation", "message": msg})
+            # If conn is None (analysis only), we return here.
+            if conn is None:
+                result["timing"]["total"] = time.perf_counter() - start_time_total
+                return result
+            # If conn is present, execute_sql_pipeline will handle this error again, but this provides early exit insight.
+            sql_pipeline_outcome["sql_error"] = msg # Store error for execute_sql_pipeline to potentially see
         else:
-             logging.info("SQL Generation successful.")
-             # Update main result dict - store generated SQL, status indicates pending execution
-             result["generated_sql"] = generated_sql
-             result["status"] = "analysis_complete_sql_generated"
-             result["message"] = "Analysis & SQL Generation complete. Execution pending."
+            logging.info("Pipeline: Initial SQL Generation successful.")
+            result["status"] = "analysis_complete_sql_generated"
+            result["message"] = "Analysis & SQL Generation complete. Execution pending or next."
+
 
     elif result["determined_route"] == "SEMANTIC":
         result["status"] = "analysis_complete_semantic_route"
         result["message"] = "Analysis complete, SEMANTIC route determined."
-        logging.info("Semantic route determined.")
-        # If conn is None, return now
-        if conn is None:
-             result["timing"]["total"] = time.perf_counter() - start_time_total
-             return result
-    else:
-        # Invalid route
+        logging.info("Pipeline: Semantic route determined.")
+    else: # Invalid route
         msg = f"Analysis failed: Unknown route '{result['determined_route']}'."
         logging.error(msg)
         result.update({"status": "error_unknown_route", "message": msg})
         result["timing"]["total"] = time.perf_counter() - start_time_total
         return result
 
-    # --- 5. Execute Pipelines & Summarize (Requires Connection) ---
-    if conn is None:
-        logging.info("DB connection is None. Skipping execution phase.")
+    # --- 5. Execute Pipelines & Summarize (Requires Connection for SQL exec or Semantic Search) ---
+    if conn is None and result["determined_route"] == "SQL": # SQL generated but no conn to execute
+        logging.info("DB connection is None. Skipping SQL execution phase. Returning generated SQL.")
         result["timing"]["total"] = time.perf_counter() - start_time_total
-        return result # Return analysis results only
+        return result
+    if qdrant_client is None and result["determined_route"] == "SEMANTIC":
+        logging.warning("Qdrant client is None. Skipping Semantic execution phase.")
+        result.update({"status": "error_semantic_no_client", "message": "Semantic route chosen but Qdrant client unavailable."})
+        result["timing"]["total"] = time.perf_counter() - start_time_total
+        return result
+    if conn is None and qdrant_client is None : # Nothing to execute
+         logging.info("Neither DB connection nor Qdrant client available. Skipping execution.")
+         result["timing"]["total"] = time.perf_counter() - start_time_total
+         return result
 
-    logging.info("Executing chosen pipeline(s)...")
+
+    logging.info("Pipeline: Executing chosen primary pipeline...")
     start_time_exec = time.perf_counter()
 
-    # Execute primary route
     if result["determined_route"] == "SQL":
-        sql_result_dict = execute_sql_pipeline(
+        # `conn` here is crucial. For benchmark_nl.py, it's the connection to the *actual* DB.
+        # If `selected_db_id_by_llm` is different, `execute_sql_pipeline` will try to run SQL
+        # (generated for `selected_db_id_by_llm`'s schema) on `conn` (for `actual_db_id`).
+        # This will likely fail, which is the desired behavior to penalize wrong DB selection.
+        sql_pipeline_outcome = execute_sql_pipeline(
             user_query=result["refined_query"],
-            selected_db_schema=selected_db_schema,
-            sample_data_str=selected_db_sample,
+            selected_db_schema=schema_for_selected_db_sql_gen, # Schema for LLM's choice
+            sample_data_str=sample_data_for_sql_gen,         # Sample for LLM's choice
             aux_models=aux_models,
-            conn=conn,
+            conn=conn, # Connection (e.g., to actual_db_id in benchmark)
             llm_wrapper=llm_wrapper,
             augmented_keywords=result["augmented_keywords"],
             max_retries=max_retries
         )
     elif result["determined_route"] == "SEMANTIC":
-        semantic_result_dict = execute_semantic_pipeline(
-            result["refined_query"], # Use refined query for semantic too
+        semantic_pipeline_outcome = execute_semantic_pipeline(
+            result["refined_query"],
             aux_models,
-            qdrant_client
+            qdrant_client # Assumed to be ready if this route is taken seriously
         )
 
     # Execute secondary route if primary failed
     # Note: Pass the *results* from the primary attempt to run_secondary_route
-    sql_result_final, semantic_result_final = run_secondary_route(
-        result["refined_query"],
-        result["determined_route"],
-        sql_result_dict, # Pass primary SQL result
-        semantic_result_dict, # Pass primary Semantic result
-        aux_models,
-        conn,
-        selected_db_schema,
-        selected_db_sample,
-        llm_wrapper,
-        qdrant_client,
-        result["augmented_keywords"]
+    sql_final_result, semantic_final_result = run_secondary_route(
+        user_query=result["refined_query"], # refined query for secondary route too
+        primary_route=result["determined_route"],
+        sql_result=sql_pipeline_outcome, # Pass primary SQL result
+        semantic_result=semantic_pipeline_outcome, # Pass primary Semantic result
+        aux_models=aux_models,
+        conn=conn, # Use same conn for secondary SQL if needed
+        selected_db_schema=schema_for_selected_db_sql_gen, # Schema of originally LLM-selected DB
+        selected_db_sample=sample_data_for_sql_gen,       # Sample of originally LLM-selected DB
+        llm_wrapper=llm_wrapper,
+        qdrant_client=qdrant_client,
+        augmented_keywords=result["augmented_keywords"]
     )
-
     result["timing"]["execution_pipelines"] = time.perf_counter() - start_time_exec
 
-    # Update main result dict with final outcomes
-    result["sql_success"] = sql_result_final.get("sql_success", False)
-    result["generated_sql"] = sql_result_final.get("generated_sql", result["generated_sql"]) # Keep latest SQL attempt
-    result["sql_data"] = sql_result_final.get("sql_data")
-    result["sql_error"] = sql_result_final.get("sql_error")
-    result["semantic_success"] = semantic_result_final.get("semantic_success", False)
-    result["semantic_data"] = semantic_result_final.get("semantic_data")
-    result["semantic_error"] = semantic_result_final.get("semantic_error")
+    # Update main result dict with final outcomes from execution pipelines
+    result["sql_success"] = sql_final_result.get("sql_success", False)
+    result["generated_sql"] = sql_final_result.get("generated_sql", result["generated_sql"]) # Keep latest SQL
+    result["sql_data"] = sql_final_result.get("sql_data")
+    result["sql_error"] = sql_final_result.get("sql_error")
+
+    result["semantic_success"] = semantic_final_result.get("semantic_success", False)
+    result["semantic_data"] = semantic_final_result.get("semantic_data")
+    result["semantic_error"] = semantic_final_result.get("semantic_error")
 
     # --- 6. Generate Summary ---
     start_time_summary = time.perf_counter()
-    nl_summary = generate_final_summary(
-        original_query,
-        result["processed_query"], # Use the query language processed version
-        was_translated,
-        result.get("sql_data"), # Pass final SQL data
-        result.get("semantic_data"), # Pass final semantic data
-        llm_wrapper
-    )
-    result["natural_language_summary"] = nl_summary
-    result["message"] = nl_summary # Set final user message
+    if llm_wrapper and llm_wrapper.is_ready: # Only generate summary if LLM is available
+        nl_summary = generate_final_summary(
+            original_query,
+            result["processed_query"],
+            was_translated,
+            result.get("sql_data"),
+            result.get("semantic_data"),
+            llm_wrapper
+        )
+        result["natural_language_summary"] = nl_summary
+        if not result["sql_error"] and not result["semantic_error"]: # If no errors, message is summary
+             result["message"] = nl_summary
+        else: # Append errors to summary if any
+             result["message"] = nl_summary + f"\n\nErrors encountered: SQL: {result['sql_error']}, Semantic: {result['semantic_error']}"
+    else:
+        result["natural_language_summary"] = "Summary LLM not available."
+        result["message"] = "LLM for summary was not available. Raw results provided."
+        if result.get("sql_data") is not None: result["message"] += f"\nSQL Data: Present"
+        if result.get("semantic_data") is not None: result["message"] += f"\nSemantic Data: Present"
+
+
     result["timing"]["summary_generation"] = time.perf_counter() - start_time_summary
 
     # Determine final status
     if result["sql_success"] or result["semantic_success"]:
-         result["status"] = "success"
-    elif result["sql_error"] or result["semantic_error"]:
-          result["status"] = "error_execution" # Specific error occurred
-          result["message"] += f"\n\n**Error Details:**\nSQL: {result['sql_error']}\nSemantic: {result['semantic_error']}"
-    else:
-          result["status"] = "success_no_results" # Ran ok, but found nothing
+        result["status"] = "success"
+    elif result["sql_error"] or result["semantic_error"]: # Check specific errors from execution
+        result["status"] = "error_execution"
+        # Message already updated above
+    elif result.get("status") not in ["error_db_selection", "error_sql_generation", "error_unknown_route", "error_semantic_no_client"]:
+        # If no specific error status set earlier, and no success, then it's no results found.
+        result["status"] = "success_no_results"
+        if not result["message"] or result["message"] == "Starting query processing...": # Ensure message is updated
+            result["message"] = "Query processed, but no specific data found matching your request."
+
 
     result["raw_display_data"] = {"sql": result.get("sql_data"), "semantic": result.get("semantic_data")}
     result["timing"]["total"] = time.perf_counter() - start_time_total

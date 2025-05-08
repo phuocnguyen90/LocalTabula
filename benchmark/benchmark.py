@@ -1,3 +1,4 @@
+# --- START OF FILE benchmark.py ---
 import os
 import json
 import sqlite3
@@ -8,506 +9,419 @@ import time
 import shutil
 import tempfile
 from typing import List, Dict, Any, Set, Tuple, Optional
+
+# Assuming utils.py is in the parent directory's utils folder
+import sys
+project_root_for_benchmark_v2 = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if project_root_for_benchmark_v2 not in sys.path:
+    sys.path.insert(0, project_root_for_benchmark_v2)
+
 try:
     from utils.utils import (
-    setup_environment, get_db_connection, init_qdrant_client, get_llm_wrapper,
-    get_cached_aux_models, get_schema_info, _generate_sql_query, # Use the core generator
-    # We need a way to execute SQL and get results robustly for comparison
+        # setup_environment, get_db_connection, init_qdrant_client, # Not strictly needed for this script's core
+        get_llm_wrapper, get_cached_aux_models,
+        get_schema_info, _generate_sql_query, # Core SQL generator
+        get_table_sample_data # For sample data helper
     )
-
+    # Import helpers from this file or define them if they were meant to be local
+    # from benchmark.benchmark_v2 import ( # This would be circular if it's the same file
+    #      load_test_suite_questions, load_test_suite_gold_sql,
+    #      combine_test_suite_data, setup_temp_database,
+    #      robust_execute_sql, compare_results
+    # )
 except ImportError as e:
     print(f"Error importing from utils: {e}")
-    print("Please ensure benchmark.py is in the correct directory relative to utils.py")
+    print("Please ensure benchmark.py is in the correct directory relative to utils.py (project_root/benchmark/benchmark.py)")
     exit(1)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(funcName)s] %(message)s')
 
-# --- Helper Functions ---
+# --- Helper Functions from previous benchmark script (ensure they are defined or imported) ---
+# These are often part of benchmark_v2 or a shared benchmark utility module.
+# For this exercise, I'll assume they are available or defined in this file if not imported.
 
 def load_test_suite_questions(filepath: str) -> List[Dict[str, Any]]:
     """Loads the questions and db_ids from the test suite JSON file."""
     try:
-        with open(filepath, 'r') as f:
-            data = json.load(f)
-            logging.info(f"Loaded {len(data)} questions/db_ids from {filepath}")
-            # Add an index to preserve order for matching with gold SQL
-            for i, item in enumerate(data):
-                item['original_index'] = i
+        with open(filepath, 'r') as f: data = json.load(f)
+        logging.info(f"Loaded {len(data)} questions/db_ids from {filepath}")
+        for i, item in enumerate(data): item['original_index'] = i
         return data
-    except FileNotFoundError:
-        logging.error(f"Test suite questions file not found: {filepath}")
-        return []
-    except json.JSONDecodeError:
-        logging.error(f"Failed to decode JSON from file: {filepath}")
-        return []
+    except Exception as e: logging.error(f"Error loading questions from {filepath}: {e}"); return []
 
 def load_test_suite_gold_sql(filepath: str) -> List[str]:
     """Loads the gold SQL queries from the .sql file (one per line)."""
     try:
-        with open(filepath, 'r') as f:
-            # Read lines, strip whitespace, and filter empty lines
-            gold_queries = [line.strip() for line in f if line.strip()]
-            logging.info(f"Loaded {len(gold_queries)} gold SQL queries from {filepath}")
+        with open(filepath, 'r') as f: gold_queries = [line.strip() for line in f if line.strip()]
+        logging.info(f"Loaded {len(gold_queries)} gold SQL queries from {filepath}")
         return gold_queries
-    except FileNotFoundError:
-        logging.error(f"Gold SQL file not found: {filepath}")   
-    return []
-
-
+    except Exception as e: logging.error(f"Error loading gold SQL from {filepath}: {e}"); return []
 
 def combine_test_suite_data(questions_data: List[Dict[str, Any]], gold_queries: List[str]) -> List[Dict[str, Any]]:
     """Combines question data with gold queries based on order."""
-    if len(questions_data) != len(gold_queries):
-        logging.error(f"Mismatch questions ({len(questions_data)}) vs gold queries ({len(gold_queries)}).")
+    if not questions_data or not gold_queries or len(questions_data) != len(gold_queries):
+        logging.error(f"Mismatch or empty questions/gold queries. Q: {len(questions_data)}, G: {len(gold_queries)}.")
         return []
-
     combined_data = []
     for i, question_item in enumerate(questions_data):
-        gold_sql = gold_queries[i]
-        actual_gold_sql = gold_sql.split('\t', 1)[0].strip() if '\t' in gold_sql else gold_sql
+        gold_sql_full = gold_queries[i]
+        actual_gold_sql = gold_sql_full.split('\t')[0].strip() if '\t' in gold_sql_full else gold_sql_full
         question_item['query'] = actual_gold_sql
         combined_data.append(question_item)
     logging.info(f"Successfully combined {len(combined_data)} test examples.")
     return combined_data
 
-
-def load_dataset(filepath: str) -> List[Dict[str, Any]]:
-    """Loads the NL-to-SQL dataset from a JSON file."""
-    try:
-        with open(filepath, 'r') as f:
-            data = json.load(f)
-        logging.info(f"Loaded {len(data)} examples from {filepath}")
-        return data
-    except FileNotFoundError:
-        logging.error(f"Dataset file not found: {filepath}")
-        return []
-    except json.JSONDecodeError:
-        logging.error(f"Failed to decode JSON from file: {filepath}")
-        return []
-
 def create_db_from_sql_script(script_path: str, db_path: str) -> bool:
-    """Creates and populates an SQLite database from a .sql script."""
     try:
-        with open(script_path, 'r', encoding='utf-8') as f:
-            sql_script = f.read()
+        with open(script_path, 'r', encoding='utf-8') as f: sql_script = f.read()
         with sqlite3.connect(db_path) as conn:
-            cursor = conn.cursor()
-            cursor.executescript(sql_script)
-            conn.commit()
-        logging.debug(f"Executed script '{script_path}' on db '{db_path}'.")
+            cursor = conn.cursor(); cursor.executescript(sql_script); conn.commit()
         return True
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error executing script '{script_path}' on db '{db_path}': {e}")
-        if os.path.exists(db_path): os.remove(db_path)
-        return False
-    except FileNotFoundError:
-        logging.error(f"SQL script file not found: '{script_path}'")
-        return False
     except Exception as e:
-        logging.error(f"Unexpected error creating db from script '{script_path}': {e}")
+        logging.error(f"Error creating DB from script '{script_path}' on '{db_path}': {e}")
         if os.path.exists(db_path): os.remove(db_path)
         return False
 
 def setup_temp_database(db_id: str, db_base_dir: str, temp_dir: str) -> Optional[str]:
-    """
-    Sets up a temporary database specifically by creating it from schema.sql
-    and potentially data.sql found within the db_base_dir/db_id/ directory.
-    Args:
-        db_id: The database identifier (e.g., 'e_commerce').
-        db_base_dir: The path to the directory containing db_id subfolders
-                     (e.g., path/to/test_database).
-        temp_dir: The path to the temporary directory for the new .sqlite file.
-    Returns:
-        The path to the created temporary database file or None on failure.
-    """
-    # Construct relative paths first
-    db_subdir_rel = os.path.join(db_base_dir, db_id)    
-    schema_sql_path_rel = os.path.join(db_subdir_rel, "schema.sql")
-    data_sql_path_rel = os.path.join(db_subdir_rel, f"{db_id}.sql") # Relative path for data script
-    temp_db_path = os.path.join(temp_dir, f"{db_id}.sqlite") # Temp path is fine relative to temp_dir
-    sqlite_src = os.path.join(db_subdir_rel, f"{db_id}.sqlite")
+    db_subdir = os.path.join(db_base_dir, db_id)
+    sqlite_src = os.path.join(db_subdir, f"{db_id}.sqlite")
+    temp_db_path = os.path.join(temp_dir, f"{db_id}.sqlite")
+
     if os.path.exists(sqlite_src):
-        logging.info(f"Found existing SQLite DB for '{db_id}'. Copying to temp.")
+        logging.debug(f"Found existing SQLite DB for '{db_id}' at '{sqlite_src}'. Copying to temp.")
         try:
             shutil.copyfile(sqlite_src, temp_db_path)
             return temp_db_path
-        except shutil.Error as e:
-            logging.error(f"Failed to copy SQLite DB '{db_id}' to temp: {e}")
+        except Exception as e:
+            logging.error(f"Failed to copy SQLite DB '{sqlite_src}' to '{temp_db_path}': {e}")
             return None
-    # --- Get and Log Absolute Paths for Checks ---
-    # os.path.abspath resolves paths relative to the Current Working Directory (CWD)
-    # Fallback: build from schema.sql (& optional <db_id>.sql) as before
-    cwd = os.getcwd()
-    abs_db_subdir = os.path.abspath(db_subdir_rel)
-    abs_schema_sql_path = os.path.abspath(schema_sql_path_rel)
-    abs_data_sql_path = os.path.abspath(data_sql_path_rel) # Absolute path for data script check
+    
+    schema_sql_path = os.path.join(db_subdir, "schema.sql")
+    data_sql_path = os.path.join(db_subdir, f"{db_id}.sql")
 
-    logging.debug(f"Current Working Directory: {cwd}")
-    logging.debug(f"Checking for schema.sql at absolute path: {abs_schema_sql_path}")
-    logging.debug(f"Base DB subdirectory absolute path: {abs_db_subdir}")
-    # --- End Debug Prints ---
-
-    # Ensure the temporary directory structure exists
-    try:
-        # Use absolute path for temp dir base? Usually fine relative.
-        os.makedirs(os.path.dirname(temp_db_path), exist_ok=True)
-    except OSError as e:
-        logging.error(f"Failed to create temporary directory '{os.path.dirname(temp_db_path)}' for DB '{db_id}': {e}")
+    if not os.path.exists(schema_sql_path):
+        logging.error(f"Schema script '{schema_sql_path}' not found for DB '{db_id}'.")
         return None
+    
+    if os.path.exists(temp_db_path): os.remove(temp_db_path) # Clear old temp file
 
-    # --- Check existence using the ABSOLUTE path ---
-    schema_exists = os.path.exists(abs_schema_sql_path)
-    logging.debug(f"os.path.exists result for schema ({abs_schema_sql_path}): {schema_exists}")
-    # ---
-
-    if schema_exists:
-        logging.info(f"Found schema.sql for '{db_id}'. Creating temporary database...")
-
-        # Remove existing temp file first (use relative/temp path)
-        if os.path.exists(temp_db_path):
-            try:
-                os.remove(temp_db_path)
-                logging.debug(f"Removed existing temp db file: {temp_db_path}")
-            except OSError as e:
-                 logging.error(f"Failed to remove existing temp db file '{temp_db_path}': {e}")
-                 return None # Abort if we can't clear the old file
-
-
-        # Create DB from schema (use relative path as it worked before for reading)
-        if create_db_from_sql_script(schema_sql_path_rel, temp_db_path):
-            # Check for and execute data population script (use absolute path for exists check)
-            data_script_exists = os.path.exists(abs_data_sql_path)
-            logging.debug(f"os.path.exists result for data script ({abs_data_sql_path}): {data_script_exists}")
-
-            if data_script_exists:
-                logging.info(f"Found data script '{data_sql_path_rel}'. Populating data...")
-                # Use relative path for reading the script
-                if not create_db_from_sql_script(data_sql_path_rel, temp_db_path):
-                     logging.error(f"Failed to populate data from '{data_sql_path_rel}'. Database may be empty.")
-                     # Decide if an empty DB is acceptable or should be an error
-                     # return None # Uncomment if data population failure should skip the example
-            else:
-                logging.warning(f"Data population script ('{os.path.basename(data_sql_path_rel)}') not found in '{db_subdir_rel}'. Database will only have schema.")
-
-            logging.debug(f"Successfully prepared temp db: {temp_db_path}")
-            return temp_db_path # Return path
+    if create_db_from_sql_script(schema_sql_path, temp_db_path):
+        if os.path.exists(data_sql_path):
+            logging.debug(f"Found data script '{data_sql_path}'. Populating data...")
+            if not create_db_from_sql_script(data_sql_path, temp_db_path):
+                logging.warning(f"Failed to populate data from '{data_sql_path}'. DB may be schema-only.")
         else:
-            logging.error(f"Failed to create temporary database for '{db_id}' from schema script '{schema_sql_path_rel}'.")
-            return None
+            logging.debug(f"Data script for '{db_id}' not found at '{data_sql_path}'. DB is schema-only.")
+        return temp_db_path
     else:
-        # If schema.sql doesn't exist using absolute path
-        logging.error(f"Cannot set up database for '{db_id}'. Schema script '{abs_schema_sql_path}' not found.")
-        # Add check for directory existence using absolute path
-        if not os.path.isdir(abs_db_subdir):
-             logging.error(f"Underlying directory also not found: {abs_db_subdir}")
+        logging.error(f"Failed to create temp DB for '{db_id}' from schema script.")
         return None
 
 def robust_execute_sql(conn: sqlite3.Connection, query: str) -> Tuple[Optional[Set[Tuple]], Optional[str], float]:
-    """
-    Executes SQL, returns results set or error message, and execution time in seconds.
-    """
-    results_set: Optional[Set[Tuple]] = None
-    error_message: Optional[str] = None
-    start_time = 0.0
-    end_time = 0.0
-    duration = 0.0
-
+    results_set: Optional[Set[Tuple]] = None; error_message: Optional[str] = None
+    start_time = 0.0; duration = 0.0
     try:
         query = query.strip().rstrip(';')
-        if not query:
-            return set(), None, 0.0 # Empty query takes no time
-
-        start_time = time.perf_counter() # Start timer just before execution
-
-        cursor = conn.cursor()
-        cursor.execute(query)
-        rows = cursor.fetchall()
-
-        end_time = time.perf_counter() # Stop timer immediately after execution
-        duration = end_time - start_time
-
-        # Process results after timing
+        if not query: return set(), None, 0.0
+        start_time = time.perf_counter()
+        cursor = conn.cursor(); cursor.execute(query); rows = cursor.fetchall()
+        duration = time.perf_counter() - start_time
         results_set = set(tuple(map(str, row)) for row in rows)
-
-    except sqlite3.Error as db_err:
-        end_time = time.perf_counter() # Still record time if error occurs during/after exec
-        duration = end_time - start_time if start_time > 0 else 0.0
-        error_message = f"SQLite Execution Error: {db_err}"
-        logging.warning(f"Query failed ({duration:.4f}s): {query} | Error: {error_message}")
     except Exception as e:
-        end_time = time.perf_counter() # Record time on general error too
-        duration = end_time - start_time if start_time > 0 else 0.0
-        error_message = f"General Execution Error: {type(e).__name__}: {e}"
-        logging.error(f"Unexpected error executing query ({duration:.4f}s): {query} | Error: {error_message}", exc_info=False)
-    # No finally needed as duration is updated in except blocks
-
-    if error_message is None:
-        logging.debug(f"Query executed successfully ({duration:.4f}s)")
-
-    return results_set, error_message, duration # Return duration
+        if start_time > 0: duration = time.perf_counter() - start_time
+        error_message = f"{type(e).__name__}: {e}"
+        logging.warning(f"Query failed ({duration:.4f}s): {query} | Error: {error_message}")
+    return results_set, error_message, duration
 
 def compare_results(gold_results: Optional[Set[Tuple]], gen_results: Optional[Set[Tuple]]) -> bool:
-    """
-    Compares two sets of results (handles None cases).
-    Returns True if they match exactly (order-insensitive).
-    """
-    if gold_results is None or gen_results is None:
-        # Cannot match if one or both failed execution or returned None
-        return False
-    # Strict equality check between the two sets
+    if gold_results is None or gen_results is None: return False
     return gold_results == gen_results
+
+# Helper for multi-table sampling (consistent with benchmark_nl.py's helper)
+def _get_multi_table_sample_str_for_benchmark( # Renamed slightly for clarity
+    db_id_for_log: str, # Used for logging context
+    db_schema_dict: Dict[str, List[str]], # Schema for this specific db_id {table: [cols]}
+    db_conn: sqlite3.Connection,
+    num_tables_to_sample: int = 3,
+    num_rows_per_table: int = 2
+) -> str:
+    """Helper to get a concatenated sample string from multiple tables of a DB."""
+    sample_parts = []
+    if not db_schema_dict:
+        logging.warning(f"[{db_id_for_log}] No schema provided for sampling.")
+        return "N/A (schema not found for sampling)"
+
+    tables_in_schema = list(db_schema_dict.keys())
+    if not tables_in_schema:
+        return "N/A (no tables in schema for sampling)"
     
-def run_benchmark(dataset: List[Dict[str, Any]], db_dir: str, llm_wrapper, aux_models, limit: Optional[int] = None):
-    """
-    Runs the benchmark evaluation loop.
-    """
-    if not llm_wrapper or not llm_wrapper.is_ready:
-        logging.error("LLM Wrapper is not ready. Aborting benchmark.")
-        return None
+    # Shuffle to get varied tables if num_tables_to_sample is less than total tables
+    import random
+    random.shuffle(tables_in_schema)
+    tables_to_sample_names = tables_in_schema[:num_tables_to_sample]
+
+    for table_name in tables_to_sample_names:
+        s_data = get_table_sample_data(db_conn, table_name, limit=num_rows_per_table) # from utils.utils
+        if s_data:
+            if "Error" not in s_data and "exists but is empty" not in s_data:
+                sample_parts.append(f"-- Sample rows from table {table_name} (in DB {db_id_for_log})\n{s_data}")
+            elif "exists but is empty" in s_data:
+                sample_parts.append(f"-- Table {table_name} (in DB {db_id_for_log}) is empty.")
+            # else: Error in s_data, perhaps log it but don't append
+        else:
+            logging.debug(f"[{db_id_for_log}] No sample data returned for table '{table_name}'.")
+
+
+    if not sample_parts:
+        return f"N/A (no data found in sampled tables for DB {db_id_for_log} or tables had errors during sampling)"
+    return "\n\n".join(sample_parts)
+
+
+# --- Main Benchmarking Logic for benchmark.py ---
+def run_benchmark(
+    dataset: List[Dict[str, Any]],
+    db_dir: str,
+    llm_wrapper, # General LLM (not used in this version for retry, but kept for consistency)
+    aux_models,  # Contains SQL LLM
+    results_filepath: str = "benchmark_simple_results.jsonl", # For JSONL output
+    limit: Optional[int] = None
+):
+    if not llm_wrapper or not llm_wrapper.is_ready: # Though not used for retry here, check for completeness
+        logging.error("LLM Wrapper (general) is not ready. Aborting benchmark.")
+        return None, 0, 0
     if not aux_models or aux_models.get('status') != 'loaded' or not aux_models.get('sql_gguf_model'):
         logging.error("Auxiliary models (specifically SQL GGUF) not ready. Aborting benchmark.")
-        return None
-    results_summary = []
-    count = 0
-    success_exec = 0
-    success_match = 0
-    skipped_db = 0
+        return None, 0, 0
 
-    # Create a temporary directory for isolated DB copies
+    # results_summary_list = [] # If you want to return a list of dicts from function
+    processed_count = 0
+    success_exec_count = 0
+    success_match_count = 0
+    skipped_db_setup_count = 0
+    generation_errors_count = 0
+    gen_sql_exec_errors_count = 0
+    gold_sql_exec_errors_count = 0
+
+
     with tempfile.TemporaryDirectory() as temp_dir:
         logging.info(f"Using temporary directory for databases: {temp_dir}")
 
         for i, example in enumerate(dataset):
-            if limit is not None and count >= limit:
-                logging.info(f"Reached benchmark limit of {limit} examples.")
+            if limit is not None and processed_count >= limit: # Check against processed_count
+                logging.info(f"Reached benchmark limit of {limit} examples processed.")
                 break
 
-            count += 1
-            logging.info(f"\n--- Processing Example {i+1}/{len(dataset)} (DB: {example['db_id']}) ---")
+            processed_count += 1
+            logging.info(f"\n--- Processing Example {processed_count}/{limit if limit else len(dataset)} (DB: {example['db_id']}, Orig Index: {example.get('original_index', 'N/A')}) ---")
             logging.info(f"Question: {example['question']}")
             logging.info(f"Gold SQL: {example['query']}")
 
+            # Initialize per-sample results
+            current_status = "Initializing"
+            generated_sql_str = None
+            gen_sql_exec_error_msg = None
+            gold_sql_exec_error_msg = None
+            exec_success_flag = False
+            match_success_flag = False
+            multi_table_sample_for_log = "N/A"
+            schema_for_db_dict = None # Store the schema dict for logging
+
             # 1. Setup Temporary Database
             temp_db_path = setup_temp_database(example['db_id'], db_dir, temp_dir)
-            
-            
             if not temp_db_path:
-                logging.warning(f"Skipping example {i+1} due to missing/failed database setup for '{example['db_id']}'.")
-                skipped_db += 1
-                results_summary.append({
-                    "original_index": example.get('original_index', i), "db_id": example['db_id'], "question": example['question'],
-                    "gold_sql": example['query'], "generated_sql": None,
-                    "status": "DB Setup Failed", "exec_success": False, "match_success": False
-                })
+                logging.warning(f"Skipping example due to DB setup failure for '{example['db_id']}'.")
+                skipped_db_setup_count += 1
+                current_status = "DB Setup Failed"
+                # Append error result and continue
+                append_result_to_jsonl({
+                    "original_index": example.get('original_index', 'N/A'), "db_id": example['db_id'],
+                    "question": example['question'], "gold_sql": example['query'],
+                    "status": current_status, "generated_sql": None,
+                    "exec_success": False, "match_success": False,
+                    "sample_data_used": multi_table_sample_for_log
+                }, results_filepath)
                 continue
 
-            # 2. Connect to Temp DB & Get Schema
-            gen_sql = None
-            gen_results = None
-            gen_error = None
-            gold_results = None
-            gold_error = None
-            exec_success = False
-            match_success = False
-            status = "Processing"
-            schema = None # Initialize schema
-            match_details = None # Store detailed diff if match fails
-
             try:
-                with sqlite3.connect(temp_db_path, timeout=10) as temp_conn: 
+                with sqlite3.connect(temp_db_path, timeout=10) as temp_conn:
+                    # 2. Get Schema and Sample Data
                     try:
-                        schema = get_schema_info(temp_conn)
-                        if not schema:
+                        schema_for_db_dict = get_schema_info(temp_conn) # This is {table_name: [cols]}
+                        if not schema_for_db_dict:
                             raise ValueError("Failed to retrieve schema from temporary database.")
-                        # Get sample data (optional, but _generate_sql_query might use it)
-                        first_table = next(iter(schema), None)
-                        sample_data_str = ""
-                        if first_table:
-                            try:
-                                sample_df_pd = pd.read_sql_query(f'SELECT * FROM "{first_table}" LIMIT 3', temp_conn)
-                                sample_data_str = sample_df_pd.to_markdown(index=False)
-                            except Exception as pd_err: logging.warning(f"Could not get sample data: {pd_err}")
-                            
                         
-                            
-
+                        multi_table_sample_for_log = _get_multi_table_sample_str_for_benchmark(
+                            example['db_id'], schema_for_db_dict, temp_conn
+                        )
+                        logging.debug(f"Multi-table sample for {example['db_id']}:\n{multi_table_sample_for_log[:300]}...")
+                        current_status = "Schema and Sample Obtained"
                     except Exception as schema_err:
-                        logging.error(f"Failed to get schema for temp DB '{temp_db_path}': {schema_err}")
-                        status = "Schema Error"
-                        # Add to summary and continue to next example
-                        results_summary.append({
-                            "original_index": example.get('original_index', i), "db_id": example['db_id'], "question": example['question'],
-                            "gold_sql": example['query'], "generated_sql": None,
-                            "status": status, "exec_success": False, "match_success": False
-                        })
-                        continue # Skip to next example if schema fails
-                    # Ensure schema is available before proceeding
-                    if not schema:
-                        logging.error("Schema is unexpectedly None after try block. Skipping generation.")
-                        status="Schema Error Post Check"
-                        # Append result and continue... (similar to above)
-                        continue
+                        logging.error(f"Failed to get schema/sample for temp DB '{temp_db_path}': {schema_err}")
+                        current_status = "Schema/Sample Error"
+                        append_result_to_jsonl({
+                            "original_index": example.get('original_index', 'N/A'), "db_id": example['db_id'],
+                            "question": example['question'], "gold_sql": example['query'],
+                            "status": current_status, "generated_sql": None,
+                            "exec_success": False, "match_success": False,
+                            "sample_data_used": multi_table_sample_for_log # Might still be N/A
+                        }, results_filepath)
+                        continue # Skip to next example
 
-                    # 3. Generate SQL using the system
-                    start_time = time.time()
-                    # Ensure aux_models is passed correctly
-                    if not isinstance(aux_models, dict): raise TypeError("aux_models is not dict")
-                    gen_sql = _generate_sql_query(
+                    # 3. Generate SQL
+                    start_time_gen = time.time()
+                    generated_sql_str = _generate_sql_query(
                         user_query=example['question'],
-                        schema=schema,
-                        sample_data_str=sample_data_str,
-                        aux_models=aux_models, # Pass the whole dict
-                        # No feedback in benchmark mode initially
-                        previous_sql=None,
-                        feedback=None
+                        schema=schema_for_db_dict, # Pass the {table:cols} schema
+                        sample_data_str=multi_table_sample_for_log, # Pass multi-table sample
+                        aux_models=aux_models, # Contains SQL LLM
+                        # No retry mechanism in this simple benchmark version
+                        previous_sql=None, feedback=None
                     )
-                    gen_time = time.time() - start_time
-                    logging.info(f"Generated SQL ({gen_time:.2f}s): {gen_sql}")
+                    gen_time_secs = time.time() - start_time_gen
+                    logging.info(f"Generated SQL ({gen_time_secs:.2f}s): {generated_sql_str}")
 
-                    if gen_sql.startswith("-- Error"):
-                        gen_error = gen_sql # Store the generation error message
-                        logging.warning("SQL generation failed.")
-                        status = "Generation Failed"
+                    if generated_sql_str.startswith("-- Error"):
+                        gen_sql_exec_error_msg = generated_sql_str # Store the generation error
+                        generation_errors_count +=1
+                        current_status = "SQL Generation Failed by LLM"
                     else:
+                        current_status = "SQL Generation Succeeded by LLM"
                         # 4. Execute Generated SQL
-                        logging.debug("Executing Generated SQL...")
-                        gen_results, gen_error, sql_exec_duration = robust_execute_sql(temp_conn, gen_sql)
-                        if gen_error:
-                            status = "Generated SQL Execution Failed"
+                        gen_results_set, gen_sql_exec_error_msg, _ = robust_execute_sql(temp_conn, generated_sql_str)
+                        if gen_sql_exec_error_msg:
+                            gen_sql_exec_errors_count += 1
+                            current_status = "Generated SQL Execution Failed"
                         else:
-                            exec_success = True
-                            success_exec += 1 # Count successful executions
-                            status = "Generated SQL Executed"
+                            exec_success_flag = True
+                            success_exec_count += 1
+                            current_status = "Generated SQL Executed Successfully"
                             logging.debug("Generated SQL executed successfully.")
 
-                            # 5. Execute Gold SQL (only if generated SQL executed)
-                            logging.debug("Executing Gold SQL...")
-                            gold_results, gold_error, sql_exec_duration = robust_execute_sql(temp_conn, example['query'])
-                            if gold_error:
-                                status = "Gold SQL Execution Failed"
-                                logging.warning(f"Gold SQL failed execution! Error: {gold_error}")
-                                # Note: We might still count exec_success for generated SQL
+                            # 5. Execute Gold SQL
+                            gold_results_set, gold_sql_exec_error_msg, _ = robust_execute_sql(temp_conn, example['query'])
+                            if gold_sql_exec_error_msg:
+                                gold_sql_exec_errors_count += 1
+                                current_status = "Gold SQL Execution Failed"
+                                logging.warning(f"Gold SQL failed execution! Error: {gold_sql_exec_error_msg}")
                             else:
-                                status = "Both Executed"
+                                current_status = "Both SQL Executed"
                                 logging.debug("Gold SQL executed successfully.")
-
                                 # 6. Compare Results
-                                match_success_bool = compare_results(gold_results, gen_results) # Get True/False
-                                if match_success_bool:
-                                    success_match += 1 # Increment counter ONLY if True
-                                    status = "Match Success"
+                                match_success_flag = compare_results(gold_results_set, gen_results_set)
+                                if match_success_flag:
+                                    success_match_count += 1
+                                    current_status = "Result Match: SUCCESS"
                                     logging.info("Result Match: SUCCESS")
                                 else:
-                                    status = "Match Failed"
+                                    current_status = "Result Match: FAILED"
                                     logging.warning("Result Match: FAILED")
-                                    # Store difference details if comparison was possible
-                                    if gold_results is not None and gen_results is not None:
-                                         missing_in_gen = gold_results - gen_results
-                                         extra_in_gen = gen_results - gold_results
-                                         # Limit size of logged diffs
-                                         max_diff_items = 5
-                                         missing_str = str(list(missing_in_gen)[:max_diff_items]) + ('...' if len(missing_in_gen) > max_diff_items else '')
-                                         extra_str = str(list(extra_in_gen)[:max_diff_items]) + ('...' if len(extra_in_gen) > max_diff_items else '')
-                                         match_details = f"Results differ. Missing in generated: {missing_str}, Extra in generated: {extra_str}"
-                                         logging.debug(match_details) # Log details here
-                                    else:
-                                         match_details = "Comparison not possible (one query failed execution)."
-                                
-
-
+                                    # Add match_details if needed, similar to benchmark_nl.py
             except Exception as outer_err:
-                status = f"Outer Loop Error: {type(outer_err).__name__}"
-                logging.error(f"Error during processing example {i+1}: {outer_err}", exc_info=True)
+                current_status = f"Outer Loop Error: {type(outer_err).__name__}"
+                logging.error(f"Error during processing example for DB '{example['db_id']}': {outer_err}", exc_info=True)
 
-
-            # Store results
-            results_summary.append({
-                "original_index": example.get('original_index', i),
+            # Store results for this sample
+            sample_result_dict = {
+                "original_index": example.get('original_index', 'N/A'),
                 "db_id": example['db_id'],
                 "question": example['question'],
                 "gold_sql": example['query'],
-                "generated_sql": gen_sql,
-                "status": status,
-                "generation_error": gen_error if status == "Generation Failed" else None,
-                "generated_sql_exec_error": gen_error if status == "Generated SQL Execution Failed" else None,
-                "gold_sql_exec_error": gold_error,
-                "exec_success": exec_success, # Based on generated query execution
-                "match_success": match_success_bool, # Only if both executed successfully
-                "match_details": match_details if not match_success_bool and match_details else None # Store diff only on failure
-            })
+                "generated_sql": generated_sql_str,
+                "status": current_status,
+                "generation_error_msg": gen_sql_exec_error_msg if current_status == "SQL Generation Failed by LLM" else None,
+                "generated_sql_exec_error": gen_sql_exec_error_msg if current_status == "Generated SQL Execution Failed" else None,
+                "gold_sql_exec_error": gold_sql_exec_error_msg,
+                "exec_success": exec_success_flag,
+                "match_success": match_success_flag,
+                "sample_data_used": multi_table_sample_for_log
+            }
+            append_result_to_jsonl(sample_result_dict, results_filepath)
+            # results_summary_list.append(sample_result_dict)
 
     # --- Calculate Metrics ---
-    total_attempted = count - skipped_db
-    if total_attempted == 0:
-        logging.warning("No examples were successfully attempted (DB setup failed for all?).")
-        exec_accuracy = 0.0
-        match_accuracy = 0.0
-    else:
-        exec_accuracy = (success_exec / total_attempted) * 100 if total_attempted > 0 else 0
-        # Match accuracy is calculated only on those queries that *executed successfully*
-        match_accuracy = (success_match / success_exec) * 100 if success_exec > 0 else 0
+    # Denominator for exec_accuracy should be examples where generation didn't fail and DB setup was OK
+    # total_candidates_for_execution = processed_count - skipped_db_setup_count - generation_errors_count
+    
+    # A simpler interpretation: how many of the *processed* samples led to successful execution?
+    total_fully_processed = processed_count - skipped_db_setup_count
+    
+    exec_accuracy = (success_exec_count / total_fully_processed) * 100 if total_fully_processed > 0 else 0.0
+    # Match accuracy: of those that executed successfully, how many matched.
+    match_accuracy = (success_match_count / success_exec_count) * 100 if success_exec_count > 0 else 0.0
 
-    logging.info("\n--- Benchmark Summary ---")
-    logging.info(f"Total examples in dataset: {len(dataset)}")
-    logging.info(f"Examples attempted (limit): {count}")
-    logging.info(f"Examples skipped (DB setup failed): {skipped_db}")
-    logging.info(f"Total examples evaluated: {total_attempted}")
-    logging.info(f"Successfully executed generated SQL: {success_exec}")
-    logging.info(f"Successfully matched gold results: {success_match}")
-    logging.info(f"Execution Accuracy (Exec Success / Total Evaluated): {exec_accuracy:.2f}%")
-    logging.info(f"Exact Set Match Accuracy (Match Success / Exec Success): {match_accuracy:.2f}%")
+    logging.info("\n--- Benchmark Summary (Simple SQL Generation Test) ---")
+    logging.info(f"Total examples in dataset provided: {len(dataset)}")
+    logging.info(f"Examples processed (or attempted up to limit): {processed_count}")
+    logging.info(f"Examples skipped (DB setup failed): {skipped_db_setup_count}")
+    logging.info(f"SQL Generation Failures (by LLM): {generation_errors_count}")
+    logging.info(f"Generated SQL Execution Errors: {gen_sql_exec_errors_count}")
+    logging.info(f"Gold SQL Execution Errors: {gold_sql_exec_errors_count}")
+    logging.info(f"Successfully executed generated SQL: {success_exec_count}")
+    logging.info(f"Generated SQL matched gold results: {success_match_count}")
+    logging.info(f"Execution Accuracy (Exec Success / (Processed - Skipped DB Setup)): {exec_accuracy:.2f}%")
+    logging.info(f"Exact Set Match Accuracy (Match Success / Successful Executions): {match_accuracy:.2f}%")
 
-    return results_summary, exec_accuracy, match_accuracy
+    return None, exec_accuracy, match_accuracy # Return None for summary list as it's written to JSONL
+
+
+def append_result_to_jsonl(result_dict: dict, filepath: str):
+    """Appends a dictionary as a JSON line to the specified file."""
+    try:
+        json_string = json.dumps(result_dict)
+        with open(filepath, 'a') as f:
+            f.write(json_string + '\n')
+    except Exception as e:
+        logging.error(f"Failed to append result to {filepath}: {e} | Data: {result_dict}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark NL-to-SQL generation using Spider Test Suite format.")
-    # Arguments specific to Test Suite
-    parser.add_argument("test_suite_file", help="Path to the test suite JSON file (e.g., test.json).")
-    parser.add_argument("gold_sql_file", help="Path to the corresponding gold SQL file (e.g., test_gold.sql).")
-    parser.add_argument("test_database_dir", help="Path to the directory containing TEST database folders (e.g., 'test_database/'). Should contain db_id subfolders with schema.sql.")
-    # General arguments
+    parser = argparse.ArgumentParser(description="Benchmark NL-to-SQL generation (simple version).")
+    parser.add_argument("test_suite_file", help="Path to the test suite JSON file (e.g., dev.json).")
+    parser.add_argument("gold_sql_file", help="Path to the corresponding gold SQL file (e.g., dev_gold.sql).")
+    parser.add_argument("database_dir", help="Path to the directory containing database folders (e.g., 'database/').")
+    # No tables.json needed here as schema is derived from live DB connection
     parser.add_argument("--limit", type=int, default=None, help="Limit the number of examples to process.")
-    parser.add_argument("--results_out", default="benchmark_test_suite_results.json", help="Path to save detailed benchmark results.")
+    parser.add_argument("--results_out_jsonl", default="benchmark_simple_results.jsonl", help="Path to save detailed benchmark results (JSONL).")
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Set the logging level.")
-
     args = parser.parse_args()
 
     logging.getLogger().setLevel(args.log_level.upper())
     logging.info(f"Logging level set to {args.log_level.upper()}")
 
+    # Clear results file if it exists
+    if os.path.exists(args.results_out_jsonl):
+        os.remove(args.results_out_jsonl)
+        logging.info(f"Removed existing results file: {args.results_out_jsonl}")
+
     logging.info("Initializing LLM Wrapper and Auxiliary Models...")
-    llm_wrapper = get_llm_wrapper()
-    aux_models = get_cached_aux_models()
+    llm_wrapper = get_llm_wrapper() # General LLM
+    aux_models = get_cached_aux_models() # Contains SQL LLM
     logging.info("Initialization complete.")
 
     questions_data = load_test_suite_questions(args.test_suite_file)
     gold_queries = load_test_suite_gold_sql(args.gold_sql_file)
-    if not questions_data or not gold_queries: exit(1)
+    if not questions_data or not gold_queries:
+        logging.error("Failed to load questions or gold queries. Exiting.")
+        exit(1)
 
     dataset = combine_test_suite_data(questions_data, gold_queries)
-    if not dataset: exit(1)
+    if not dataset:
+        logging.error("Failed to combine dataset. Exiting.")
+        exit(1)
 
-    # --- Pass the specific test_database_dir to run_benchmark ---
-    results, exec_acc, match_acc = run_benchmark(
+    _, exec_acc, match_acc = run_benchmark(
         dataset=dataset,
-        db_dir=args.test_database_dir, # Use the test database directory path
+        db_dir=args.database_dir,
         llm_wrapper=llm_wrapper,
         aux_models=aux_models,
+        results_filepath=args.results_out_jsonl,
         limit=args.limit
     )
-    # ---
 
-    if results:
-        try:
-            output_results = [{k: v for k, v in item.items()} for item in results]
-            with open(args.results_out, 'w') as f:
-                json.dump(output_results, f, indent=2)
-            logging.info(f"Detailed results saved to {args.results_out}")
-        except Exception as e:
-            logging.error(f"Failed to save results to {args.results_out}: {e}")
-
-    logging.info("Benchmarking finished.")
+    logging.info(f"Simple SQL generation benchmarking finished. Results appended to {args.results_out_jsonl}")
+    logging.info(f"Overall Execution Accuracy: {exec_acc:.2f}%")
+    logging.info(f"Overall Exact Set Match Accuracy: {match_acc:.2f}%")
 
 if __name__ == "__main__":
     main()
+# --- END OF FILE benchmark.py ---

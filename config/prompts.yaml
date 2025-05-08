@@ -46,15 +46,16 @@ generate_sql_base: |
 
   **Rules:**
   1. Generate a valid SQLite query and end with a semicolon.
-  2. SELECT either `*` or only the columns needed to answer the question.
-  3. Use numeric comparisons without units (e.g. `COUNT < 5`).
-  4. For text filter related requests, try to use augmented_keywords and use `column LIKE '%keyword%' COLLATE NOCASE`. Group multiple keywords in an `OR` clause, e.g.: 
+  2. Unless specically instructed to do so, do NOT prefix table names with the database ID or filename (e.g., use 'FROM table_name' not 'FROM db_id.table_name').
+  3. SELECT either `*` or only the columns needed to answer the question.
+  4. Use numeric comparisons without units (e.g. `COUNT < 5`).
+  5. For text filter related requests, try to use augmented_keywords and use `column LIKE '%keyword%' COLLATE NOCASE`. Group multiple keywords in an `OR` clause, e.g.: 
 
      WHERE (LOWER(col) LIKE '%keyword1%' OR LOWER(col) LIKE '%keyword2%')
     
-  5. Resolve ties for MIN/MAX via subqueries or ORDER BY … LIMIT ….
-  6. Skip ORDER BY/LIMIT unless the question explicitly asks for “top N” or “first/last”.
-  7. Do not alter the schema or data.
+  6. Resolve ties for MIN/MAX via subqueries or ORDER BY … LIMIT ….
+  7. Skip ORDER BY/LIMIT unless the question explicitly asks for “top N” or “first/last”.
+  8. Do not alter the schema or data.
 
 
 
@@ -63,19 +64,31 @@ generate_sql_base: |
   
 
 # Addendum for SQL generation retries based on feedback
-generate_sql_feedback_syntax: |
+generate_sql_feedback_syntax_correction: |
 
-  PREVIOUS ATTEMPT FAILED due to a syntax error.
+  The following SQL query attempt contained a syntax error:
   Incorrect SQL: `{previous_sql}`
+  The error reported was: "{error_message}"
   Error: "{feedback}"
-  Please correct the syntax.
+  Please provide clear, concise instruction on how to fix or prevent this error.
 
-generate_sql_feedback_other: |
+generate_sql_feedback_schema_issue: |
 
-  PREVIOUS ATTEMPT was unsatisfactory.
+  The following SQL query attempt failed due to a schema-related issue (e.g., a table or column was not found as named):
   SQL Executed: `{previous_sql}`
-  Reason: "{feedback}"
-  Please generate an improved query incorporating this feedback.
+  The error reported was: "{error_message}"
+  {schema_context_reminder}
+  Based on this error and the schema originally provided, please generate a corrected SQL query.
+  For example, if the error was "no such table db_name.table_name", ensure you use only "table_name".
+  If the error was "no such column x", ensure column "x" exists in the specified table or correct the join condition.
+
+generate_sql_feedback_other_improvement: |
+
+  The following SQL query was previously generated:
+  SQL Executed: `{previous_sql}`
+  However, it needs improvement. 
+  Reason: "{reason_for_improvement}"
+  Please generate an improved SQL query that addresses this reason while still answering the original user request based on the provided schema and sample data.
 
 # Final instruction for SQL generation response format
 generate_sql_response_format: |
