@@ -27,6 +27,7 @@ dotenv.load_dotenv('.env', override=True)
 SQLITE_TIMEOUT_SECONDS = 15
 QDRANT_COLLECTION_PREFIX = "table_data_" # Using prefix convention
 BASE_DIR = Path(__file__).resolve().parent.parent
+MODELS_BASE_DIR = BASE_DIR / "models"
 CONFIG_DIR = BASE_DIR / "config"
 PROMPT_PATH = CONFIG_DIR / "prompts.yaml"
 
@@ -91,7 +92,7 @@ def setup_environment():
 # --- Imports from other local modules ---
 # (Keep these as they were in your provided file)
 from llm_interface import LLMWrapper
-from model import load_aux_models
+from aux_model import load_aux_models
 
 # --- Cached Resource Initializers ---
 @st.cache_resource

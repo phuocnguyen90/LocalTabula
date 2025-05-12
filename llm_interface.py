@@ -4,6 +4,7 @@ import logging
 from dotenv import load_dotenv
 import json
 import torch
+from pathlib import Path
 
 # Conditional Imports
 try:
@@ -21,8 +22,26 @@ except ImportError:
     llama_cpp_available = False
     logging.warning("llama_cpp library not found. Local GGUF mode disabled.")
 
+try:
+    from huggingface_hub import hf_hub_download # <--- ADD
+    hf_hub_available = True
+except ImportError:
+    hf_hub_available = False
+    logging.warning("huggingface_hub library not found. Automatic GGUF download disabled for main LLM.")
+
+from utils.utils import ENV_PATH
 # --- Load Environment Variables ---
-load_dotenv('.env', override=True)
+load_dotenv(ENV_PATH, override=True)
+try:
+    # This assumes utils.py is in a 'utils' subdirectory from where app.py (and thus BASE_DIR) is defined
+    # Or that llm_interface.py and utils.py share a common understanding of BASE_DIR
+    _PROJECT_ROOT = Path(__file__).resolve().parent.parent # Adjust if llm_interface.py is nested deeper
+    MODELS_BASE_DIR = _PROJECT_ROOT / "models"
+except NameError: # Fallback if utils.MODELS_BASE_DIR is not easily importable here
+    _PROJECT_ROOT = Path(os.getcwd()) # Or Path(__file__).resolve().parent
+    MODELS_BASE_DIR = _PROJECT_ROOT / "models"
+    logging.warning(f"Could not import MODELS_BASE_DIR, defaulting to relative path: {MODELS_BASE_DIR}")
+
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -72,6 +91,19 @@ class LLMWrapper:
     def _init_local_gguf(self):
         logging.info("Initializing in PRODUCTION mode (Local GGUF)...")
         self.mode = "local_gguf"
+
+        model_path_str = os.getenv("LOCAL_LLM_GGUF_MODEL_PATH") # This is now expected to be set by download_models.py
+
+        if not model_path_str:
+            logging.error("LOCAL_LLM_GGUF_MODEL_PATH not set. Run download_models.py first.")
+            return
+        
+        model_path = Path(model_path_str)
+        if not model_path.exists():
+            logging.error(f"Main LLM GGUF file not found at: {model_path}. Run download_models.py.")
+            return
+
+        # 2) Load GGUF model
         vram_before = torch.cuda.memory_allocated(0) if torch.cuda.is_available() else 0
         logging.info(f"VRAM before main LLM load: {vram_before/1024**2:.1f} MiB")
 
