@@ -17,6 +17,7 @@ from utils.utils import (
     derive_requirements_from_history,
     QDRANT_COLLECTION_PREFIX
 )
+from utils.load_model import initialize_all_models
 
 # --- Config Logging & Filter ---
 
@@ -29,8 +30,7 @@ if not DB_PATH:
 # --- Initialize Backend Resources ---
 db_conn = get_db_connection(DB_PATH)
 qdrant_client = init_qdrant_client()
-llm_wrapper = get_llm_wrapper()
-aux_models = get_cached_aux_models()
+llm_wrapper, aux_models = initialize_all_models()
 
 # --- Check if GPU is available ---
 if torch.cuda.is_available():

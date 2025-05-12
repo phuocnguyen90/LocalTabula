@@ -26,10 +26,16 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 dotenv.load_dotenv('.env', override=True)
 SQLITE_TIMEOUT_SECONDS = 15
 QDRANT_COLLECTION_PREFIX = "table_data_" # Using prefix convention
-BASE_DIR = Path(__file__).resolve().parent.parent
-MODELS_BASE_DIR = BASE_DIR / "models"
-CONFIG_DIR = BASE_DIR / "config"
+PROJECT_ROOT  = Path(__file__).resolve().parent.parent
+MODELS_BASE_DIR = PROJECT_ROOT  / "models"
+CONFIG_DIR = PROJECT_ROOT  / "config"
 PROMPT_PATH = CONFIG_DIR / "prompts.yaml"
+
+MODELS_BASE_DIR = PROJECT_ROOT / "models"
+MAIN_LLM_SUBDIR = MODELS_BASE_DIR / "main_llm"
+AUX_MODELS_SUBDIR = MODELS_BASE_DIR / "auxiliary"
+SQL_LLM_SUBDIR_IN_AUX = AUX_MODELS_SUBDIR / "sql_llm"
+EMBEDDING_SUBDIR_IN_AUX = AUX_MODELS_SUBDIR / "embedding_cache"
 
 ENV_PATH = CONFIG_DIR / ".env"
 load_dotenv(dotenv_path=str(ENV_PATH))  
@@ -92,7 +98,7 @@ def setup_environment():
 # --- Imports from other local modules ---
 # (Keep these as they were in your provided file)
 from llm_interface import LLMWrapper
-from aux_model import load_aux_models
+from utils.aux_model import load_aux_models
 
 # --- Cached Resource Initializers ---
 @st.cache_resource

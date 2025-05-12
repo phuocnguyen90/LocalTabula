@@ -28,7 +28,7 @@ import traceback # For detailed error logging in query processing
 
 # Import the new LLM wrapper and aux model loader
 from llm_interface import LLMWrapper
-from aux_model import load_aux_models # Renamed import
+from utils.aux_model import load_aux_models # Renamed import
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent

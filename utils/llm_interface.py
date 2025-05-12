@@ -29,19 +29,15 @@ except ImportError:
     hf_hub_available = False
     logging.warning("huggingface_hub library not found. Automatic GGUF download disabled for main LLM.")
 
-from utils.utils import ENV_PATH
-# --- Load Environment Variables ---
-load_dotenv(ENV_PATH, override=True)
-try:
-    # This assumes utils.py is in a 'utils' subdirectory from where app.py (and thus BASE_DIR) is defined
-    # Or that llm_interface.py and utils.py share a common understanding of BASE_DIR
-    _PROJECT_ROOT = Path(__file__).resolve().parent.parent # Adjust if llm_interface.py is nested deeper
-    MODELS_BASE_DIR = _PROJECT_ROOT / "models"
-except NameError: # Fallback if utils.MODELS_BASE_DIR is not easily importable here
-    _PROJECT_ROOT = Path(os.getcwd()) # Or Path(__file__).resolve().parent
-    MODELS_BASE_DIR = _PROJECT_ROOT / "models"
-    logging.warning(f"Could not import MODELS_BASE_DIR, defaulting to relative path: {MODELS_BASE_DIR}")
+# Import ENV_PATH from .utils (sibling module in the same package)
+from .utils import ENV_PATH # Use relative import for sibling modules
 
+# --- Load Environment Variables ---
+# Load from the central .env file specified by utils.py
+if ENV_PATH.exists():
+    load_dotenv(ENV_PATH, override=True)
+else:
+    logging.warning(f".env file not found at {ENV_PATH}. LLMWrapper might not function correctly.")
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -89,76 +85,69 @@ class LLMWrapper:
             logging.error(f"OpenRouter init error: {e}", exc_info=True)
 
     def _init_local_gguf(self):
-        logging.info("Initializing in PRODUCTION mode (Local GGUF)...")
+        logging.info("Initializing in PRODUCTION mode (Local GGUF - Main LLM)...")
         self.mode = "local_gguf"
 
-        model_path_str = os.getenv("LOCAL_LLM_GGUF_MODEL_PATH") # This is now expected to be set by download_models.py
+        # Read the local path set by download_models.py
+        model_path_str = os.getenv("LOCAL_MAIN_LLM_PATH")
 
         if not model_path_str:
-            logging.error("LOCAL_LLM_GGUF_MODEL_PATH not set. Run download_models.py first.")
+            logging.error("LOCAL_MAIN_LLM_PATH not set in .env. Run scripts/download_models.py first.")
             return
         
         model_path = Path(model_path_str)
         if not model_path.exists():
-            logging.error(f"Main LLM GGUF file not found at: {model_path}. Run download_models.py.")
+            logging.error(f"Main LLM GGUF file not found at specified path: {model_path}. "
+                          "Ensure it was downloaded correctly by scripts/download_models.py.")
             return
 
-        # 2) Load GGUF model
         vram_before = torch.cuda.memory_allocated(0) if torch.cuda.is_available() else 0
         logging.info(f"VRAM before main LLM load: {vram_before/1024**2:.1f} MiB")
 
+        use_cpu_str = os.getenv("MAIN_LLM_USE_CPU", "false").lower()
+        use_cpu = use_cpu_str in ("true", "1", "t", "y", "yes")
+
         if not torch.cuda.is_available():
-            logging.info("No GPU detected; loading GGUF on CPU.")
-            use_cpu = True
-        else:
-            use_cpu = os.getenv("LLM_USE_CPU", "false").lower() in ("true","1","t","y","yes")
-            if use_cpu:
-                logging.info("LLM_USE_CPU=true; loading GGUF on CPU.")
+            logging.info("No GPU detected; loading Main LLM on CPU.")
+            use_cpu = True # Force CPU if no CUDA
+        elif use_cpu:
+            logging.info("MAIN_LLM_USE_CPU=true; loading Main LLM on CPU.")
         
-        # read GPU‐layers override (or fallback to old var for backward‐compat)
         try:
-            raw = os.getenv("LLM_GPU_LAYERS",
-                            os.getenv("GGUF_N_GPU_LAYERS", "-1"))
-            n_gpu_layers = int(raw)
+            n_gpu_layers_str = os.getenv("MAIN_LLM_N_GPU_LAYERS", "-1")
+            n_gpu_layers = int(n_gpu_layers_str)
         except ValueError:
+            logging.warning(f"Invalid value for MAIN_LLM_N_GPU_LAYERS: '{n_gpu_layers_str}'. Defaulting to -1.")
             n_gpu_layers = -1
 
         if use_cpu:
             n_gpu_layers = 0
-        elif not torch.cuda.is_available():
-            n_gpu_layers = 0
-        logging.info(f"GGUF n_gpu_layers={n_gpu_layers}")
+        
+        logging.info(f"Main LLM GGUF n_gpu_layers={n_gpu_layers}")
 
-        # context length
         try:
-            raw = os.getenv("LLM_N_CTX", os.getenv("GGUF_N_CTX", "2048"))
-            n_ctx = int(raw)
+            n_ctx_str = os.getenv("MAIN_LLM_N_CTX", "4096")
+            n_ctx = int(n_ctx_str)
         except ValueError:
-            n_ctx = 2048
-        logging.info(f"GGUF n_ctx={n_ctx}")
+            logging.warning(f"Invalid value for MAIN_LLM_N_CTX: '{n_ctx_str}'. Defaulting to 4096.")
+            n_ctx = 4096
+        logging.info(f"Main LLM GGUF n_ctx={n_ctx}")
 
-        # model path
-        model_path = os.getenv("LOCAL_LLM_GGUF_MODEL_PATH")
-        if not model_path or not os.path.exists(model_path):
-            logging.error(f"LOCAL_LLM_GGUF_MODEL_PATH invalid: {model_path!r}")
-            return
-
-        # finally load
         try:
-            logging.info(f"Loading GGUF model from: {model_path}")
+            logging.info(f"Loading Main LLM GGUF model from: {model_path}")
             self.local_model = Llama(
-                model_path=model_path,
+                model_path=str(model_path), # Llama cpp expects string
                 n_gpu_layers=n_gpu_layers,
                 n_ctx=n_ctx,
                 verbose=False
             )
             self.is_ready = True
-            logging.info("Local GGUF model loaded successfully.")
+            logging.info("Main LLM (local GGUF) loaded successfully.")
             vram_after = torch.cuda.memory_allocated(0) if torch.cuda.is_available() else 0
             delta = (vram_after - vram_before) / (1024**2)
             logging.info(f"VRAM after main LLM load: {vram_after/1024**2:.1f} MiB  (Δ {delta:.1f} MiB)")
         except Exception as e:
-            logging.error(f"Failed to load GGUF: {e}", exc_info=True)
+            logging.error(f"Failed to load Main LLM GGUF: {e}", exc_info=True)
 
 
     def generate_response(self, prompt: str, max_tokens: int = 500, temperature: float = 0.7) -> str:
