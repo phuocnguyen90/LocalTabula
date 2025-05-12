@@ -52,7 +52,7 @@ def download_all_models():
             downloaded_main_llm_path = hf_hub_download(
                 repo_id=main_repo,
                 filename=main_file,
-                local_dir=MODELS_BASE_DIR,
+                local_dir=MAIN_LLM_CACHE_DIR,
                 token=hf_token
             )
             print(f"Main LLM downloaded to: {downloaded_main_llm_path}")
