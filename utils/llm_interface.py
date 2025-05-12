@@ -315,16 +315,3 @@ class LLMWrapper:
         except Exception as e:
             logging.error(f"Error during structured generation: {e}", exc_info=True)
             return None # Indicate general failure
-
-# --- Optional: Test ---
-if __name__ == "__main__":
-     print("Testing LLMWrapper...")
-     wrapper = LLMWrapper()
-     if wrapper.is_ready:
-         print(f"Wrapper ready in mode: {wrapper.mode}")
-         test_prompt = "Who are you and what model are you based on?"
-         print(f"\nTest Prompt: {test_prompt}")
-         response = wrapper.generate_response(test_prompt, max_tokens=100)
-         print(f"\nTest Response:\n{response}")
-     else:
-         print("\nWrapper failed to initialize. Check env vars and logs.")

@@ -187,3 +187,4 @@ temp.py
 /utils/finetuning
 *.txt
 tabular_chat_local_llm.ipynb:Zone.Identifier
+/models

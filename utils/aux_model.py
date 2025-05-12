@@ -4,9 +4,10 @@ import logging
 from fastembed import TextEmbedding
 from pathlib import Path 
 from dotenv import load_dotenv
-
+import torch
 # Import ENV_PATH from .utils (sibling module in the same package)
-from .utils import ENV_PATH, get_free_gpu_memory_mb # Assuming get_free_gpu_memory_mb is in utils.utils
+from utils.utils import ENV_PATH
+
 
 try:
     from llama_cpp import Llama
@@ -153,28 +154,3 @@ def load_aux_models() -> dict:
         logging.error(f"Aux model loading failed: {models['error_message']}")
 
     return models
-
-# --- Optional: Test Aux Models ---
-if __name__ == "__main__":
-    print("Testing auxiliary model loading directly...")
-    aux_models = load_aux_models()
-    print(f"\nAux models loading status: {aux_models.get('status')}")
-
-    if aux_models.get('sql_gguf_model'):
-        print("SQL GGUF model appears loaded.")
-        # Add a simple generation test if desired
-        try:
-            sql_llm = aux_models.get('sql_gguf_model')
-            test_sql_prompt = "SELECT COUNT(*) FROM employees;" # Simple prompt
-            print(f"\nTesting SQL GGUF with prompt: '{test_sql_prompt}'")
-            output = sql_llm(test_sql_prompt, max_tokens=50, temperature=0.1)
-            print("SQL GGUF Response:", output)
-        except Exception as e:
-            print(f"Error during SQL GGUF test generation: {e}")
-
-    if aux_models.get('embedding_model'):
-        print("Embedding model appears loaded.")
-        # Add embedding test if desired
-
-    if aux_models.get('status') != 'loaded':
-        print("\nError:", aux_models.get('error_message', 'Unknown loading error'))

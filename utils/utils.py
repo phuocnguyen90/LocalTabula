@@ -21,6 +21,7 @@ from collections import Counter # For detecting duplicate columns
 import shutil
 
 
+
 # --- Configuration & Constants ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 dotenv.load_dotenv('.env', override=True)
@@ -41,6 +42,11 @@ ENV_PATH = CONFIG_DIR / ".env"
 load_dotenv(dotenv_path=str(ENV_PATH))  
 MAX_SCHEMA_CHARS_ESTIMATE = 20000 # Rough estimate for prompt length control
 
+
+# --- Import your model loading classes/functions AFTER env is loaded ---
+from .llm_interface import LLMWrapper  # Assuming llm_interface.py is in utils/
+from .aux_model import load_aux_models # Assuming aux_model.py is in utils/
+
 # --- Load Prompts ---
 def load_prompts():
     """
@@ -57,7 +63,7 @@ if PROMPTS is None:
     st.stop() # Halt execution if prompts failed to load
 else:
     logging.info('Prompts loaded successfully.')
-    logging.info(f"Loaded prompts keys: {list(PROMPTS.keys())}")
+    # logging.debug(f"Loaded prompts keys: {list(PROMPTS.keys())}")
 
 
 # --- Environment Setup ---
@@ -95,34 +101,30 @@ def setup_environment():
         logging.error(f"An unexpected error occurred during environment setup: {e}", exc_info=True)
         return None
 
-# --- Imports from other local modules ---
-# (Keep these as they were in your provided file)
-from llm_interface import LLMWrapper
-from utils.aux_model import load_aux_models
 
 # --- Cached Resource Initializers ---
 @st.cache_resource
 def get_llm_wrapper():
-    """Initializes and caches the LLMWrapper."""
-    logging.info("Attempting to get/initialize LLMWrapper...")
+    
+    logging.info("Attempting to get/initialize LLMWrapper (cached)...")
+    # LLMWrapper itself will load .env using ENV_PATH from this module
     wrapper = LLMWrapper()
     if not wrapper.is_ready:
-        logging.error("LLMWrapper initialization failed.")
+        logging.error("LLMWrapper initialization failed (cached call).")
+    else:
+        logging.info("LLMWrapper initialized successfully (cached call).")
     return wrapper
 
 @st.cache_resource
 def get_cached_aux_models():
-    """Loads and caches auxiliary models (SQL, Embedder)."""
-    logging.info("Cache miss or first run: Calling load_aux_models...")
-    models_dict_from_loader = load_aux_models()
-    if not isinstance(models_dict_from_loader, dict):
-        logging.error(f"CRITICAL: load_aux_models returned type {type(models_dict_from_loader)} instead of dict!")
-        return {"status": "error", "error_message": "Internal Error: Model loader returned invalid type."}
-    if models_dict_from_loader.get('status') != 'loaded':
-         logging.warning(f"Aux model loading status: {models_dict_from_loader.get('status')}. Error: {models_dict_from_loader.get('error_message', 'N/A')}")
+    logging.info("Attempting to get/initialize Auxiliary Models (cached)...")
+    # load_aux_models itself will load .env using ENV_PATH from this module
+    models_dict = load_aux_models()
+    if models_dict.get('status') != 'loaded':
+         logging.warning(f"Aux model loading status (cached call): {models_dict.get('status')}. Error: {models_dict.get('error_message', 'N/A')}")
     else:
-        logging.info("Aux models loaded and cached successfully.")
-    return models_dict_from_loader
+        logging.info("Auxiliary models loaded successfully (cached call).")
+    return models_dict
 
 @st.cache_resource
 def get_db_connection(db_path):
@@ -318,7 +320,7 @@ def select_database_id(
     user_query: str,
     schema_and_samples: dict,    
     available_db_ids: list, # Pass original keys for validation
-    llm_wrapper: LLMWrapper,
+    llm_wrapper,
     conversation_history: Optional[list[dict]] = None # Keep if prompt uses it
 ) -> Optional[str]:
     """ Uses LLM to select the most relevant DB ID (table name) using formatted schema+sample context. """
@@ -385,7 +387,7 @@ def select_database_id(
 
 # --- LLM Interaction Helpers ---
 
-def _ensure_english_query(user_query: str, llm_wrapper: LLMWrapper) -> tuple[str, bool]:
+def _ensure_english_query(user_query: str, llm_wrapper) -> tuple[str, bool]:
     """Checks if query is English. If not, attempts translation using LLM."""
     # (Implementation remains the same as provided, using prompts from PROMPTS)
     logging.info("Checking query language...")
@@ -431,7 +433,7 @@ def refine_and_select(
     conversation_history: Optional[list[dict]],
     selected_db_schema: dict,        # { table_name: [cols] }
     sample_data_str: Optional[str],  # raw sample snippet or None
-    llm_wrapper: LLMWrapper
+    llm_wrapper
 ) -> dict:
     """ Refines query, picks route, and augments keywords for a single DB context. """
     default_result = {
@@ -668,7 +670,7 @@ def _execute_sql_query(conn, sql_query):
         return pd.DataFrame(), f"An unexpected error occurred during SQL execution: {type(e).__name__}"
 
 # <-- MODIFIED HELPER -->
-def _validate_sql_results(user_query: str, executed_sql: str, result_df: pd.DataFrame, llm_wrapper: LLMWrapper) -> tuple[bool, str | None]:
+def _validate_sql_results(user_query: str, executed_sql: str, result_df: pd.DataFrame, llm_wrapper) -> tuple[bool, str | None]:
     """Uses LLM to validate if SQL results satisfy the user query."""
     # (Implementation remains the same as provided - uses prompts, parses JSON/text)
     logging.info("Validating SQL results using LLM...")
@@ -756,7 +758,7 @@ def _validate_sql_results(user_query: str, executed_sql: str, result_df: pd.Data
 # These generally remain the same, but ensure logging includes table_name/db_id
 # Make sure collection names consistently use the QDRANT_COLLECTION_PREFIX + table_name (db_id)
 
-def _suggest_semantic_columns(df_head: pd.DataFrame, schema: dict, table_name: str, llm_wrapper: LLMWrapper) -> list[str]:
+def _suggest_semantic_columns(df_head: pd.DataFrame, schema: dict, table_name: str, llm_wrapper) -> list[str]:
     """Uses LLM to suggest semantic columns. Needs the schema for the specific table."""
     # (Implementation mostly the same, ensure it uses the correct prompt key)
     logging.info(f"[{table_name}] Requesting LLM suggestion for semantic columns...")
@@ -1394,8 +1396,16 @@ def process_natural_language_query(
 
     result["selected_db_id"] = selected_db_id_by_llm
     # Schema for the LLM-selected DB, for SQL generation
-    schema_for_selected_db_sql_gen = {selected_db_id_by_llm: full_schema[selected_db_id_by_llm]}
+    if selected_db_id_by_llm not in full_schema:
+        logging.error(f"LLM selected DB ID '{selected_db_id_by_llm}' which is not in full_schema keys: {list(full_schema.keys())}. This should not happen if select_database_id validates.")
+        # Handle this critical error, perhaps return an error state.
+        return {**result, "status": "error_internal_db_selection", "message": f"Internal error: Selected DB ID '{selected_db_id_by_llm}' not found in schema."}
+
+    # schema_for_sql_and_refine is the actual schema of the selected DB
+    schema_for_sql_and_refine = full_schema[selected_db_id_by_llm] # This is Dict[table_name, List[cols]]
+
     logging.info(f"LLM Selected DB ID: {selected_db_id_by_llm}")
+    logging.debug(f"Schema for selected DB ('{selected_db_id_by_llm}') for SQL/Refine: {schema_for_sql_and_refine}")
     logging.debug(f"Sample for SQL Gen for '{selected_db_id_by_llm}':\n{sample_data_for_sql_gen[:300]}...")
 
     # --- 3. Refine Query & Determine Route (using selected context) ---
@@ -1403,7 +1413,7 @@ def process_natural_language_query(
     refinement_data = refine_and_select(
         user_query=processed_query, # Use language-processed query
         conversation_history=conversation_history,
-        selected_db_schema=schema_for_selected_db_sql_gen, # Schema of the DB chosen by LLM
+        selected_db_schema=schema_for_sql_and_refine, # Schema of the DB chosen by LLM
         sample_data_str=sample_data_for_sql_gen,           # Sample from the DB chosen by LLM
         llm_wrapper=llm_wrapper,
     )
@@ -1432,7 +1442,7 @@ def process_natural_language_query(
         # This `generated_sql_string` is the attempt before any retries from `execute_sql_pipeline`.
         generated_sql_string = _generate_sql_query(
             user_query=result["refined_query"],
-            schema=schema_for_selected_db_sql_gen,
+            schema=schema_for_sql_and_refine,
             sample_data_str=sample_data_for_sql_gen,
             aux_models=aux_models,
             augmented_keywords=result["augmented_keywords"]
@@ -1494,7 +1504,7 @@ def process_natural_language_query(
         # This will likely fail, which is the desired behavior to penalize wrong DB selection.
         sql_pipeline_outcome = execute_sql_pipeline(
             user_query=result["refined_query"],
-            selected_db_schema=schema_for_selected_db_sql_gen, # Schema for LLM's choice
+            selected_db_schema=schema_for_sql_and_refine, # Schema for LLM's choice
             sample_data_str=sample_data_for_sql_gen,         # Sample for LLM's choice
             aux_models=aux_models,
             conn=conn, # Connection (e.g., to actual_db_id in benchmark)
@@ -1518,7 +1528,7 @@ def process_natural_language_query(
         semantic_result=semantic_pipeline_outcome, # Pass primary Semantic result
         aux_models=aux_models,
         conn=conn, # Use same conn for secondary SQL if needed
-        selected_db_schema=schema_for_selected_db_sql_gen, # Schema of originally LLM-selected DB
+        selected_db_schema=schema_for_sql_and_refine, # Schema of originally LLM-selected DB
         selected_db_sample=sample_data_for_sql_gen,       # Sample of originally LLM-selected DB
         llm_wrapper=llm_wrapper,
         qdrant_client=qdrant_client,
@@ -1760,7 +1770,7 @@ def process_uploaded_data(uploaded_file, gsheet_published_url, table_name, conn,
 
 
 # --- Management Functions ---
-def reindex_table(conn: sqlite3.Connection, table_name: str, llm_wrapper: LLMWrapper, aux_models: dict, qdrant_client: QdrantClient) -> tuple[bool, str]:
+def reindex_table(conn: sqlite3.Connection, table_name: str, llm_wrapper, aux_models: dict, qdrant_client: QdrantClient) -> tuple[bool, str]:
     """Reads data from SQLite, re-suggests columns, re-embeds, re-indexes."""
     # (Implementation remains the same as provided, uses updated helpers)
     logging.info(f"[{table_name}] Attempting to re-index...")
@@ -1829,7 +1839,7 @@ def delete_table_data(conn: sqlite3.Connection, table_name: str, qdrant_client: 
     return overall_success, final_message
 
 
-def derive_requirements_from_history(conversation_history: list[dict], llm_wrapper: LLMWrapper, max_turns: int = 10) -> str:
+def derive_requirements_from_history(conversation_history: list[dict], llm_wrapper, max_turns: int = 10) -> str:
     """
     Takes conversation history and asks LLM to summarize requirements.
     Uses prompt from PROMPTS.

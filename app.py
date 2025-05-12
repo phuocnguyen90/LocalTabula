@@ -15,9 +15,10 @@ from utils.utils import (
     get_sqlite_table_row_count, get_qdrant_collection_info,
     reindex_table, delete_table_data,
     derive_requirements_from_history,
-    QDRANT_COLLECTION_PREFIX
+    QDRANT_COLLECTION_PREFIX,
+    get_llm_wrapper, get_cached_aux_models
 )
-from utils.load_model import initialize_all_models
+
 
 # --- Config Logging & Filter ---
 
@@ -30,7 +31,14 @@ if not DB_PATH:
 # --- Initialize Backend Resources ---
 db_conn = get_db_connection(DB_PATH)
 qdrant_client = init_qdrant_client()
-llm_wrapper, aux_models = initialize_all_models()
+
+# Use the new cached functions for models
+st.write("Initializing models (this should only print messages on first run or if cache is cleared)...")
+llm_wrapper = get_llm_wrapper()
+aux_models = get_cached_aux_models()
+st.write("Model initialization functions called.")
+
+
 
 # --- Check if GPU is available ---
 if torch.cuda.is_available():
@@ -292,8 +300,9 @@ with tab_data_manage:
 
                         if success:
                             st.success(f"Data processing completed successfully for `{entered_table_name}`.")
-                            st.session_state.schema = get_schema_info(db_conn) # Refresh schema
-                            logging.info(f"Schema refreshed after processing. Tables: {list(st.session_state.schema.keys())}")
+                            updated_raw_schema = get_schema_info(db_conn)
+                            st.session_state.schema = {"default": updated_raw_schema} # Refresh schema
+                            logging.info(f"Schema refreshed after processing. Tables: {list(st.session_state.schema.get('default', {}).keys())}")
                             st.session_state.confirm_replace_needed = False
                             st.session_state.confirm_replace_details = {}
                             st.rerun() # Rerun to update overview and inputs
@@ -316,18 +325,24 @@ with tab_data_manage:
     # --- Section 2: Database Overview ---
     st.subheader("Database Status & Overview")
     # Refresh schema from DB connection if ready
+    # Refresh schema from DB connection if ready
     if db_ready:
-        st.session_state.schema = get_schema_info(db_conn)
-    current_schema = st.session_state.schema # Use the potentially updated schema
+        # Maintain the {"default": actual_schema} structure
+        refreshed_raw_schema = get_schema_info(db_conn)
+        st.session_state.schema = {"default": refreshed_raw_schema}
+        logging.info(f"Schema refreshed in Data Management. Top-level keys: {list(st.session_state.schema.keys())}")
+
+    # For displaying the schema in the overview, you'd access the "default" key
+    current_schema_for_display = st.session_state.schema.get("default", {})
 
     if not db_ready:
         st.warning("Database not connected.")
-    elif not current_schema:
+    elif not current_schema_for_display: # Check the content of the "default" schema
         st.info("No tables found in the database. Load data using the section above.")
     else:
-        st.write(f"**Tables found:** {len(current_schema)}")
+        st.write(f"**Tables found:** {len(current_schema_for_display)}")
         overview_data = []
-        for table_name, columns in current_schema.items():
+        for table_name, columns in current_schema_for_display.items():
             row_count = get_sqlite_table_row_count(db_conn, table_name)
             collection_name = f"{QDRANT_COLLECTION_PREFIX}{table_name}"
             # Use the new helper to fetch the most recent collection info for this table.
@@ -354,7 +369,7 @@ with tab_data_manage:
 
         # Detailed view per table
         with st.expander("Show Table Schema Details"):
-            for table_name, columns in current_schema.items():
+            for table_name, columns in current_schema_for_display.items():
                 st.markdown(f"**Table: `{table_name}`**")
                 cols_md = "\n".join([f"- `{col}`" for col in columns])
                 st.markdown(cols_md)
@@ -362,10 +377,11 @@ with tab_data_manage:
 
     # --- Section 3: Manage Existing Tables ---
     st.subheader("Manage Existing Tables")
-    if not current_schema:
+    schema_to_manage = st.session_state.schema.get("default", {})
+    if not schema_to_manage:
         st.info("Load data first to manage tables.")
     else:
-        table_options = sorted(list(current_schema.keys())) # Sort for consistency
+        table_options = sorted(list(schema_to_manage.keys())) # Sort for consistency
 
         # --- Logic to determine default index for selectbox ---
         default_index = 0 # Default to first option if no state or state invalid

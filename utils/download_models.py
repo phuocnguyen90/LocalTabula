@@ -4,19 +4,24 @@ import sys
 from pathlib import Path
 from dotenv import load_dotenv, set_key
 from huggingface_hub import hf_hub_download
-from fastembed import TextEmbedding # To trigger its download
+from fastembed import TextEmbedding 
 
-# Add project root to sys.path to allow importing from 'utils'
+
+# Ensure the project root is in sys.path to import utils
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
-from utils.utils import (
-    ENV_PATH,
-    MODELS_BASE_DIR,
-    MAIN_LLM_SUBDIR,
-    SQL_LLM_SUBDIR_IN_AUX,
-    EMBEDDING_SUBDIR_IN_AUX
-)
+# Define MODELS_BASE_DIR here if not importing from utils
+MODELS_BASE_DIR = PROJECT_ROOT / "models"
+
+# Define specific cache subdirectories
+MAIN_LLM_CACHE_DIR = MODELS_BASE_DIR / "main_llm"
+SQL_GGUF_CACHE_DIR = MODELS_BASE_DIR / "auxiliary" / "sql_gguf"
+EMBEDDING_CACHE_DIR = MODELS_BASE_DIR / "auxiliary" / "embedding_cache"
+
+# Path to the .env file that stores final model paths
+# This could be config/.env or a separate config/paths.env
+ENV_PATH = PROJECT_ROOT / "config" / ".env" # Or "config/paths.env"
 
 def update_env_file(key, value):
     """Updates or adds a key-value pair in the .env file."""
@@ -29,9 +34,9 @@ def update_env_file(key, value):
 def download_all_models():
     print(f"Using base directory for models: {MODELS_BASE_DIR}")
     MODELS_BASE_DIR.mkdir(parents=True, exist_ok=True)
-    MAIN_LLM_SUBDIR.mkdir(parents=True, exist_ok=True)
-    SQL_LLM_SUBDIR_IN_AUX.mkdir(parents=True, exist_ok=True)
-    EMBEDDING_SUBDIR_IN_AUX.mkdir(parents=True, exist_ok=True)
+    MAIN_LLM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    SQL_GGUF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    EMBEDDING_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     # Load REPO_IDs and FILENAMES from the central .env file
     load_dotenv(ENV_PATH, override=True) # Override to ensure we get download configs
@@ -42,13 +47,12 @@ def download_all_models():
     main_repo = os.getenv("MAIN_LLM_REPO_ID")
     main_file = os.getenv("MAIN_LLM_FILENAME")
     if main_repo and main_file:
-        print(f"Downloading Main LLM: {main_repo}/{main_file} to {MAIN_LLM_SUBDIR}...")
+        print(f"Downloading Main LLM: {main_repo}/{main_file} to {MODELS_BASE_DIR}...")
         try:
             downloaded_main_llm_path = hf_hub_download(
                 repo_id=main_repo,
                 filename=main_file,
-                local_dir=MAIN_LLM_SUBDIR,
-                local_dir_use_symlinks=False,
+                local_dir=MODELS_BASE_DIR,
                 token=hf_token
             )
             print(f"Main LLM downloaded to: {downloaded_main_llm_path}")
@@ -63,13 +67,12 @@ def download_all_models():
     sql_repo = os.getenv("SQL_LLM_REPO_ID")
     sql_file = os.getenv("SQL_LLM_FILENAME")
     if sql_repo and sql_file:
-        print(f"Downloading SQL LLM: {sql_repo}/{sql_file} to {SQL_LLM_SUBDIR_IN_AUX}...")
+        print(f"Downloading SQL LLM: {sql_repo}/{sql_file} to {SQL_GGUF_CACHE_DIR}...")
         try:
             downloaded_sql_llm_path = hf_hub_download(
                 repo_id=sql_repo,
                 filename=sql_file,
-                local_dir=SQL_LLM_SUBDIR_IN_AUX,
-                local_dir_use_symlinks=False,
+                local_dir=SQL_GGUF_CACHE_DIR,
                 token=hf_token
             )
             print(f"SQL LLM downloaded to: {downloaded_sql_llm_path}")
@@ -83,13 +86,13 @@ def download_all_models():
     # 3. Embedding Model
     embed_repo_name = os.getenv("EMBEDDING_MODEL_REPO_NAME")
     if embed_repo_name:
-        print(f"Ensuring Embedding Model ({embed_repo_name}) is cached in {EMBEDDING_SUBDIR_IN_AUX}...")
+        print(f"Ensuring Embedding Model ({embed_repo_name}) is cached in {EMBEDDING_CACHE_DIR}...")
         try:
             # TextEmbedding will download to its own structure within the specified cache_dir
-            TextEmbedding(model_name=embed_repo_name, cache_dir=str(EMBEDDING_SUBDIR_IN_AUX))
-            print(f"Embedding model '{embed_repo_name}' cached in '{EMBEDDING_SUBDIR_IN_AUX}'.")
-            update_env_file("LOCAL_EMBEDDING_CACHE_DIR", str(EMBEDDING_SUBDIR_IN_AUX))
-            os.environ["LOCAL_EMBEDDING_CACHE_DIR"] = str(EMBEDDING_SUBDIR_IN_AUX) # For current session
+            TextEmbedding(model_name=embed_repo_name, cache_dir=str(EMBEDDING_CACHE_DIR))
+            print(f"Embedding model '{embed_repo_name}' cached in '{EMBEDDING_CACHE_DIR}'.")
+            update_env_file("LOCAL_EMBEDDING_CACHE_DIR", str(EMBEDDING_CACHE_DIR))
+            os.environ["LOCAL_EMBEDDING_CACHE_DIR"] = str(EMBEDDING_CACHE_DIR) # For current session
         except Exception as e:
             print(f"ERROR caching Embedding Model '{embed_repo_name}': {e}")
     else:

@@ -2,14 +2,14 @@ import os
 import sys
 from pathlib import Path
 from dotenv import load_dotenv
-
+import logging
 # Ensure the project root is in sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
 # These imports are now from your actual project structure
-from llm_interface import LLMWrapper # Assuming llm_interface.py is at project_root or in a module
-from utils.aux_model import load_aux_models     # Assuming model.py is at project_root or in a module
+from utils.llm_interface import LLMWrapper 
+from utils.aux_model import load_aux_models     
 
 import pynvml
 def get_free_gpu_memory_mb(device_index: int = 0) -> int:
