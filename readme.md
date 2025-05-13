@@ -21,7 +21,7 @@ Many “chat-to-data” tools live in the cloud and hide their inner workings be
 
 ## What You Can Do
 
-* **Upload & Index:** Clean column names, build a SQLite database, then select and embed text columns automatically.
+* **Convert & Index tabular data to SQL database:** Clean column names, build a SQLite database, then select and embed text columns automatically.
 * **Natural-Language Queries:** Ask things like “What’s our Q1 revenue by region?” or “Find products like X.”
 * **Smart Routing:** The app decides—SQL or semantic search—then packages schema and sample rows for context.
 * **Inspect & Tweak:** Expand SQL statements, preview raw rows or embeddings, and re-index on demand.
