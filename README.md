@@ -2,7 +2,8 @@
 
  
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPLv3-yellow.svg)](https://www.gnu.org/licenses/gpl-3.0.en.html)
-
+[![English README](https://img.shields.io/badge/README-English-blue)](README.md)
+[![Tiếng Việt README](https://img.shields.io/badge/README-vi-red)](README.vi.md)
 
 
 **LocalTabula** is a Streamlit app that transforms your spreadsheets into an interactive chat—right on your machine. Drop in an Excel file or a published Google Sheet CSV, then ask questions in plain English. No cloud services, no data leaks: everything runs locally, powered by SQLite and an in‑memory Qdrant vector store.
@@ -140,4 +141,4 @@ During development, I wrapped the core LLM logic in `LLMWrapper`, letting you sw
    We’re adding an interactive SQL console so you can write and run custom queries alongside the automated pipeline.
 
 3. **Google Colab Support**
-   There’s an experimental `main.ipynb` for Colab, with ngrok tunneling to expose the Streamlit app. Because Colab currently runs CUDA 12.5, GPU setup can be tricky—if you plan to use Colab, we recommend the 8B llama-3.1 model for smooth performance.
+   There’s an experimental `main.ipynb` for Colab for testing purpose, with ngrok tunneling to expose the Streamlit app. Because Colab currently runs CUDA 12.5, GPU setup can be tricky—if you plan to use Colab, we recommend the 8B llama-3.1 model for smooth performance.
