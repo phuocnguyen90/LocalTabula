@@ -3,7 +3,7 @@
  
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPLv3-yellow.svg)](https://www.gnu.org/licenses/gpl-3.0.en.html)
 [![English README](https://img.shields.io/badge/README-English-blue)](README.md)
-[![Tiếng Việt README](https://img.shields.io/badge/README-vi-red)](README.vi.md)
+[![Tiếng Việt README](https://img.shields.io/badge/README-Tiếng_Việt-red)](README.vi.md)
 
 
 **LocalTabula** is a Streamlit app that transforms your spreadsheets into an interactive chat—right on your machine. Drop in an Excel file or a published Google Sheet CSV, then ask questions in plain English. No cloud services, no data leaks: everything runs locally, powered by SQLite and an in‑memory Qdrant vector store.
@@ -49,6 +49,11 @@ Sure, API-driven powerhouses like ChatGPT or Claude can nail SQL generation, and
 * **Offline or API:** During development, point to OpenRouter; in production, run purely local GGUF models (with optional GPU acceleration).
 
 ---
+![alt text](images/image.png)
+Data jobs in Vietnam
+
+![alt text](images/image-2.png)
+Car sales dataset: [Kaggle](https://www.kaggle.com/datasets/jainaru/electric-car-sales-2010-2024?resource=download)
 
 ## Under the Hood: The 5-Stage Query Pipeline
 

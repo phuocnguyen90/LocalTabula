@@ -1806,4 +1806,3 @@ def derive_requirements_from_history(conversation_history: list[dict], llm_wrapp
     except Exception as e:
         logging.error(f"Error deriving requirements from history: {e}", exc_info=True)
         return "" # Return empty string on error
-

@@ -1,7 +1,7 @@
 # LocalTabula: Truy vấn dữ liệu bảng bằng ngôn ngữ tự nhiên
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPLv3-yellow.svg)](https://www.gnu.org/licenses/gpl-3.0.en.html)[![English README](https://img.shields.io/badge/README-English-blue)](README.md)
 
-**LocalTabula** là một ứng dụng Streamlit biến bảng tính của bạn thành cuộc trò chuyện trực tiếp trên máy. Kéo thả file Excel hoặc dán link CSV từ Google Sheet công khai, rồi đặt câu hỏi bằng tiếng Anh hay tiếng Việt—không cần chờ đám mây, không lo lộ dữ liệu. Tất cả diễn ra ngay trên máy bạn, dùng SQLite và Qdrant lưu trữ vector để tìm kiếm thông minh.
+**LocalTabula** là một ứng dụng Streamlit giúp bạn trò chuyện trực tiếp với dữ liệu dạng bảng trên máy tính. Kéo thả file Excel hoặc dán link CSV từ Google Sheet công khai, rồi đặt câu hỏi bằng tiếng Anh hay tiếng Việt—không cần chờ đám mây, không lo lộ dữ liệu. Tất cả diễn ra ngay trên máy bạn, dùng SQLite và Qdrant lưu trữ vector để tìm kiếm thông minh.
 
 ---
 
@@ -11,17 +11,17 @@ Có thể ChatGPT hay Claude cho kết quả SQL rất tốt, và nhiều dịch
 
 * **Bảo mật & Tuân thủ**
 * **Ngân sách cố định**
-* **Tùy biến triệt để**
+* **Tùy biến cao**
 
-thì chạy local vẫn là lựa chọn duy nhất đảm bảo dữ liệu nằm trong tầm kiểm soát và chi phí không “lố” mất kiểm soát.
+thì chạy local vẫn là lựa chọn duy nhất đảm bảo dữ liệu nằm trong tầm kiểm soát và với chi phí xác định.
 
 1. **Chủ Quyền Dữ Liệu & Tuân Thủ**
 
-   Dữ liệu ở lại trong hệ thống, không chui ra internet. GDPR, HIPAA hay chính sách nội bộ cứ yên tâm.
+   Dữ liệu ở lại trong hệ thống, không chui ra internet. GDPR, HIPAA hay chính sách nội bộ không thành rào cản.
 
 2. **Chi Phí Định Trước**
 
-   Không lo thanh toán theo token hay hoá đơn bất ngờ. Một lần đầu tư phần cứng, sau đó chạy thả ga miễn phí.
+   Không lo thanh toán theo token hay hoá đơn bất ngờ. Một lần đầu tư phần cứng, sau đó chạy hoàn toàn miễn phí.
 
 3. **Độ Trễ & Độ Ổn Định**
 
@@ -33,7 +33,7 @@ thì chạy local vẫn là lựa chọn duy nhất đảm bảo dữ liệu n�
 
 5. **Chỉnh Độ Chính Xác Với Model Nhỏ**
 
-   Với pip-sql-1.3b, bạn dễ dàng đạt \~90% chính xác trên các câu hỏi cơ bản, nhưng khi vào phần hỏi lắt léo, độ chính xác có thể rớt còn \~30%. LocalTabula giải quyết bằng pipeline đa giai đoạn cùng prompt engineering—template thoải mái sửa, few-shot, retry loop, feedback prompt—để “vỗ” model nhỏ thành công cụ mạnh mẽ.
+   Theo thử nghiệm lý thuyết Với pip-sql-1.3b, bạn dễ dàng đạt ~90% chính xác trên các câu hỏi cơ bản, nhưng khi vào phần hỏi lắt léo (và bầng tiếng Việt), độ chính xác có thể thấp hơn rất nhiều. LocalTabula giải quyết bằng pipeline đa giai đoạn cùng prompt engineering—template thoải mái sửa, few-shot, retry loop, feedback prompt—để “vỗ” model nhỏ thành công cụ mạnh mẽ.
 
 6. **Tùy Biến & Mở Rộng**
 
@@ -54,6 +54,13 @@ thì chạy local vẫn là lựa chọn duy nhất đảm bảo dữ liệu n�
 * **Offline hoặc API:** Giai đoạn dev dùng OpenRouter, deploy thì chạy offline với GGUF (có thể bật GPU).
 
 ---
+## Hình minh họa
+![alt text](images/image.png)
+Data jobs in Vietnam
+
+![alt text](images/image-2.png)
+Car sales dataset: [Kaggle](https://www.kaggle.com/datasets/jainaru/electric-car-sales-2010-2024?resource=download)
+
 
 ## Hoạt Động Bên Trong: Pipeline 5 Giai Đoạn
 

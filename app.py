@@ -33,10 +33,10 @@ db_conn = get_db_connection(DB_PATH)
 qdrant_client = init_qdrant_client()
 
 # Use the new cached functions for models
-st.write("Initializing models (this should only print messages on first run or if cache is cleared)...")
+
 llm_wrapper = get_llm_wrapper()
 aux_models = get_cached_aux_models()
-st.write("Model initialization functions called.")
+
 
 
 
@@ -45,6 +45,8 @@ if torch.cuda.is_available():
     logging.info("GPU is available.")
 else:
     logging.info("GPU is not available. Using CPU.")
+
+
 
 
 # --- Perform Readiness Checks ---
@@ -93,6 +95,47 @@ if "selected_table_manage" not in st.session_state:
     st.session_state.selected_table_manage = next(iter(st.session_state.schema), None)
 if "confirm_delete_table" not in st.session_state:
     st.session_state.confirm_delete_table = None  # Stores table name pending delete confirmation
+
+def _process_data():
+    """Callback to read the uploader/URL + table name and run process_uploaded_data."""
+    uploaded_file = st.session_state.data_upload
+    gsheet_url    = st.session_state.data_gsheet.strip()
+    table_name    = st.session_state.data_table_name.strip()
+
+    # Reset the confirmation flag so we don’t loop
+    st.session_state.process_now_confirmed = False
+
+    # Run the same utility you were already calling
+    success, message = process_uploaded_data(
+        uploaded_file,
+        gsheet_url,
+        table_name,
+        db_conn,
+        llm_wrapper,
+        aux_models,
+        qdrant_client,
+        replace_confirmed=True
+    )
+
+    # Display logs & result
+    if message:
+        st.subheader("Processing Log")
+        st.text(message)
+
+    if success:
+        st.success(f"Data processing completed for `{table_name}`.")
+        # Refresh schema in session
+        st.session_state.schema = {"default": get_schema_info(db_conn)}
+    else:
+        st.error(f"Data processing failed for `{table_name}`. See log above.")
+
+    # Clear any pending replace-confirm state
+    st.session_state.confirm_replace_needed = False
+    st.session_state.confirm_replace_details = {}
+
+
+# Header
+st.title("Chat with Your Data")
 
 # --- Define Tabs ---
 tab_chat, tab_data_manage = st.tabs(["💬 Chat", "💾 Data Management"])
@@ -227,12 +270,9 @@ with tab_data_manage:
             st.warning(f"Table `{entered_table_name}` already exists. Replacing it will delete and reload the data and vector index.", icon="⚠️")
             col1_confirm, col2_confirm = st.columns(2)
             with col1_confirm:
-                if st.button("Yes, Replace Table", key="confirm_replace_yes", type="primary"):
-                    st.session_state.confirm_replace_needed = False
-                    st.session_state.process_now_confirmed = True # Signal to process
-                    # No need to set confirm_replace_details here, process flow will use input
-                    logging.info(f"User confirmed replacement for table: {entered_table_name}")
-                    st.rerun()
+                if st.button("Yes, Replace Table", key="confirm_replace_yes", on_click=_process_data):
+                    # confirmation flag is implicitly handled inside _process_data
+                    pass
             with col2_confirm:
                 if st.button("No, Cancel Load", key="confirm_replace_no"):
                     st.session_state.confirm_replace_needed = False
@@ -253,10 +293,12 @@ with tab_data_manage:
                 or (not uploaded_file and not gsheet_published_url)
                 or confirm_needed # Disable if confirmation is pending for a *different* table
             )
-            if st.button("Load and Process Data", disabled=load_disabled, key="process_data_button"):
-                st.session_state.process_now_confirmed = True # Signal intent to process
-                logging.info(f"Load button clicked for table: {entered_table_name}")
-                st.rerun() # Rerun to trigger the processing logic below
+            st.button(
+                "Load and Process Data",
+                disabled=load_disabled,
+                key="process_data_button",
+                on_click=_process_data
+            )
 
         # --- Processing Logic ---
         # This block runs *after* the button click + rerun, or after confirmation + rerun
@@ -325,7 +367,7 @@ with tab_data_manage:
     # --- Section 2: Database Overview ---
     st.subheader("Database Status & Overview")
     # Refresh schema from DB connection if ready
-    # Refresh schema from DB connection if ready
+
     if db_ready:
         # Maintain the {"default": actual_schema} structure
         refreshed_raw_schema = get_schema_info(db_conn)
@@ -498,6 +540,7 @@ with tab_data_manage:
                             # Set state to trigger confirmation on next rerun
                             st.session_state.confirm_delete_table = selected_table
                             st.rerun()
+
 
 
 # --- Footer (Optional) ---
