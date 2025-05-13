@@ -141,6 +141,7 @@ class LLMWrapper:
                 n_ctx=n_ctx,
                 verbose=False
             )
+            
             self.is_ready = True
             logging.info("Main LLM (local GGUF) loaded successfully.")
             vram_after = torch.cuda.memory_allocated(0) if torch.cuda.is_available() else 0

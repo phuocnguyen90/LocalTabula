@@ -1,8 +1,8 @@
-# GPU Setup Note
+# WSL GPU Setup Note
 
 > **Note to Future Self:**
 >
-> When using a GPU, you need to rebuild **llama-cpp-python** with CUDA support.
+> For WSL When using a GPU, you need to rebuild **llama-cpp-python** with CUDA support.
 > Replace `cuda-xx.x` with the version you have installed on your system.
 
 1. **Set CMake arguments** (adjust paths to your CUDA installation):
@@ -26,3 +26,16 @@
    ```bash
    pip install llama-cpp-python --upgrade --force-reinstall --no-cache-dir
    ```
+
+# Running on Google colab T4
+
+```bash
+!CMAKE_ARGS="-DGGML_CUDA=on"
+!pip install https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.4-cu124/llama_cpp_python-0.3.4-cp311-cp311-linux_x86_64.whl
+```
+
+**Warning:** This works and uses the GPU but doesnt suppport newer architectures like Gemma 3
+https://github.com/abetlen/llama-cpp-python/issues/1780 
+
+Change MAIN_LLM_REPO_ID to 
+MAIN_LLM_FILENAME="google_gemma-3-4b-it-Q5_K_M.gguf" 
