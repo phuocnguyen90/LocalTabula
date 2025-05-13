@@ -1,116 +1,106 @@
-# Chat With Your Data: Natural Language Tabular Data Assistant
+# LocalTabula: Natural Language Tabular Data Assistant
 
 [![Python Version](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)  
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-This Streamlit web app lets you upload tabular data (Excel files or published Google Sheet CSV URLs) and query it in plain language. It uses LLMs for SQL generation, semantic search, and natural language summarization.
+# LocalTabula: Your Local-First Tabular Data Assistant
 
-## Key Features
+**LocalTabula** is a Streamlit app that transforms your spreadsheets into an interactive chat—right on your machine. Drop in an Excel file or a published Google Sheet CSV, then ask questions in plain English. No cloud services, no data leaks: everything runs locally, powered by SQLite and an in‑memory Qdrant vector store.
 
-- **Natural Language Queries:** Ask questions about your data in everyday language.
-- **Multiple Data Sources:** Supports Excel uploads and CSV URLs from published Google Sheets.
-- **Automated Data Processing:**  
-  - Converts data to an SQLite database.  
-  - Uses an LLM to select text columns for embedding.  
-  - Embeds text with FastEmbed and indexes them in an in-memory Qdrant vector DB.
-- **Intelligent Query Routing:**  
-  - **SQL Mode:** Generates and executes SQL queries against SQLite.
-  - **Semantic Mode:** Performs vector similarity searches on embedded data.
-- **LLM-Powered SQL Generation:**  
-  - Uses a specialized GGUF model (e.g., `PipableAI/pip-sql-1.3b`) via `llama-cpp-python`.  
-  - Includes prompt engineering and a retry loop for error correction.
-- **Dual LLM Backend Modes:**  
-  - **Development:** Uses OpenRouter API with JSON outputs for routing and summarization.  
-  - **Production/Local:** Fully offline with locally loaded GGUF models.
-- **Optional GPU Acceleration:** For faster local GGUF inference via CUDA/ROCm/Metal.
+---
 
-## Technology Stack
+## Why Local First?
 
-- **Backend:** Python 3.10+, Pandas, SQLite  
-- **Web Framework:** Streamlit  
-- **LLMs & Embeddings:** llama-cpp-python, FastEmbed (`paraphrase-multilingual-mpnet-base-v2`), OpenRouter API  
-- **Vector Database:** Qdrant (in-memory)  
-- **Configuration:** python-dotenv, huggingface_hub
+Many “chat-to-data” tools live in the cloud and hide their inner workings behind rigid UIs. LocalTabula flips the script:
 
-## Setup
+* **Full Ownership:** Your data never leaves your computer.
+* **Customizable Pipeline:** Tweak prompts, swap models, and tune indexing to fit your needs.
+* **Multi-Stage Architecture:** Each step validates and refines, so you get accurate, explainable results.
 
-1. **Clone the Repository:**
+---
+
+## What You Can Do
+
+* **Upload & Index:** Clean column names, build a SQLite database, then select and embed text columns automatically.
+* **Natural-Language Queries:** Ask things like “What’s our Q1 revenue by region?” or “Find products like X.”
+* **Smart Routing:** The app decides—SQL or semantic search—then packages schema and sample rows for context.
+* **Inspect & Tweak:** Expand SQL statements, preview raw rows or embeddings, and re-index on demand.
+* **Offline or API:** During development, point to OpenRouter; in production, run purely local GGUF models (with optional GPU acceleration).
+
+---
+
+## Under the Hood: The 5-Stage Query Pipeline
+
+1. **Preflight & Normalization**
+   Convert any user question into clear English so local models (or your custom ones) perform at their best. Swap or disable this step via `prompts.yaml`.
+
+2. **Route & Schema Prep**
+   Choose SQL or semantic mode based on your question’s structure. Attach the relevant table’s schema and a few sample rows to guide the LLM.
+
+3. **Prompt Refinement (Optional)**
+   An LLM polishes your query into a tightly defined SQL prompt. Great for non-experts—skip it if you prefer writing your own SQL.
+
+4. **Execution & Fallback**
+
+   * **SQL Mode:** Generate, validate, and run SQL against SQLite. On error, loop once for correction.
+   * **Semantic Mode:** Embed your question, run a vector search over Qdrant, and return top text snippets.
+     If your primary route returns nothing, the other route kicks in as a safety net.
+
+5. **Natural-Language Summary**
+   Feed raw results back into an LLM to produce a conversational answer—no more staring at raw tables. Edit the final summary prompt in `prompts.yaml` or disable it to see raw outputs.
+
+---
+
+## Tweak These Knobs
+
+All configurations live in **`.env`**, **`config/prompts.yaml`**, and the helper functions in **`utils.py`**:
+
+| Stage                | File / Function                           | Customize                                              |
+| -------------------- | ----------------------------------------- | ------------------------------------------------------ |
+| Language Normalizer  | `prompts.yaml`                            | Swap translation logic or disable                      |
+| DB Selection         | `select_database_id` / `prompts.yaml`     | Change sample size, prompt template, or fallback logic |
+| Refinement & Routing | `refine_and_select` / `prompts.yaml`      | Adjust few-shots, temperature, or force-mode flags     |
+| SQL Generation       | `generate_sql_*` / `aux_models`           | Swap GGUF models, tweak examples, or retry logic       |
+| SQL Execution        | `utils._execute_sql_query`                | Modify DB path, pragmas, or timeouts                   |
+| Semantic Search      | `init_qdrant_client` / `aux_models`       | Change embedding model, top-k, or distance metric      |
+| Summary              | `generate_final_summary` / `prompts.yaml` | Edit tone, detail level, or skip entirely              |
+
+---
+
+## Getting Started
+
+1. **Clone & Activate**
+
    ```bash
-   git clone <your-repository-url>
-   cd <your-repository-name>
+   git clone <repo-url> && cd <repo>
+   python -m venv venv && source venv/bin/activate
+   ```
 
-2. **Create and Activate a Virtual Environment:**
-    ```bash
-    python -m venv venv
-    source venv/bin/activate  # Linux/macOS
-    venv\Scripts\activate     # Windows
+2. **Install Dependencies**
 
-3. **Install Dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-    ```python
-    pip install -r requirements.txt
-    ```
+   For GPU support, reinstall `llama-cpp-python` with proper CMake flags.
 
-    For GPU acceleration, install llama-cpp-python with appropriate compilation flags (see llama-cpp-python docs).
+3. **Configure**
+   Copy `.env.example` to `.env` and set:
 
-4. **Configure Environment Variables:**
-Copy and edit .env.example to create your .env file. Key variables include:
+   * `DEVELOPMENT_MODE` (true for OpenRouter, false for local GGUF)
+   * Paths or repo IDs for your GGUF models
+   * API keys (if using OpenRouter)
 
-        DEVELOPMENT_MODE (true for OpenRouter, false for local GGUF)
+4. **Run**
 
-        OPENROUTER_API_KEY & OPENROUTER_MODEL_NAME (for development)
+   ```bash
+   streamlit run app.py
+   ```
 
-        GGUF_MODEL_PATH, SQL_GGUF_REPO_ID, SQL_GGUF_FILENAME (for production/local)
+   Visit `http://localhost:8501` and start chatting with your data!
 
-    Download Models:
-    The SQL GGUF model downloads automatically via huggingface_hub. For local mode, download the main GGUF model manually and set its path in .env.
+---
 
-## Running the Application
+For GPU support, read the README file under config folder
 
-# Start the App:
-    ```bash
-    streamlit run app.py
-
-Open your browser at the URL provided by Streamlit (typically http://localhost:8501).
-
-## Usage
-
-1. **Load Data:**
-    Use the sidebar to upload an Excel file or paste a published Google Sheet CSV URL. Enter a table name and process the data to build the SQLite database and vector index.
-
-2. **Chat:**
-    Type your natural language query into the chat box. The app routes the query to either SQL or semantic search, retrieves results, and provides a natural language summary. Expanders reveal raw SQL or data if needed.
-
-3. **Modes: Development vs. Production**
-
-    Development Mode (DEVELOPMENT_MODE=true):
-    Leverages the OpenRouter API for quick iterations.
-
-    Production/Local Mode (DEVELOPMENT_MODE=false):
-    Runs entirely locally using GGUF models for full offline operation.
-
-4. **GPU Acceleration (Optional)**
-
-    Requirements:
-
-        NVIDIA/AMD drivers, CUDA/ROCm toolkit, build tools (cmake, etc.)
-
-    Installation:
-    Uninstall and reinstall llama-cpp-python with the proper CMAKE_ARGS for your GPU.
-
-    Configuration:
-    Set GGUF_N_GPU_LAYERS in your .env to enable GPU offloading.
-
-5. **Troubleshooting**
-
-    Model/Download Issues: Verify your internet connection, HF_TOKEN, and cache permissions.
-
-    GGUF Loading Errors: Check your model paths, compatibility, and resource availability.
-
-    Database Locks: Ensure the database isn’t accessed concurrently (use local DB or adjust timeouts).
-
-    OpenRouter Errors: Confirm API keys and rate limits.
-
-## License
-
-Licensed under the MIT License.
+**Work in Progress:** The core pipeline is stable, but the UI and settings panel are evolving. Contributions and feedback are welcome—this is your homegrown tool!

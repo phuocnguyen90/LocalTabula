@@ -43,7 +43,7 @@ load_dotenv(dotenv_path=str(ENV_PATH))
 MAX_SCHEMA_CHARS_ESTIMATE = 20000 # Rough estimate for prompt length control
 
 
-# --- Import your model loading classes/functions AFTER env is loaded ---
+# --- Import your model loading functions ---
 from .llm_interface import LLMWrapper  # Assuming llm_interface.py is in utils/
 from .aux_model import load_aux_models # Assuming aux_model.py is in utils/
 
@@ -570,10 +570,6 @@ def _generate_sql_query(
             prompt_parts.append(PROMPTS['generate_sql_feedback_schema_issue'].format(
                 previous_sql=previous_sql,
                 error_message=feedback,
-                # We might need to pass schema_json and sample_data again here if they are not sticky enough
-                # from the base prompt, or trust the LLM remembers it from generate_sql_base.
-                # For now, let's assume the base prompt's schema is still in its "attention".
-                # The key is to point out *what kind* of error it was.
                 schema_context_reminder="Remember to strictly adhere to the tables and columns defined in the provided database schema."
             ))
         else: # General "other" errors (e.g., validation failure from general LLM)
@@ -747,16 +743,6 @@ def _validate_sql_results(user_query: str, executed_sql: str, result_df: pd.Data
     except Exception as e:
         logging.error(f"Error during LLM validation call: {e}", exc_info=True)
         return True, None # Fail safely: assume satisfactory
-
-
-# --- Semantic Search and Qdrant Helpers ---
-# (Functions: _perform_semantic_search, get_qdrant_collection_info,
-#  _suggest_semantic_columns, prepare_collection, prepare_documents,
-#  compute_vector_size, create_qdrant_collection_with_retry,
-#  create_or_update_collection, _embed_and_index_data, reindex_table,
-#  delete_table_data)
-# These generally remain the same, but ensure logging includes table_name/db_id
-# Make sure collection names consistently use the QDRANT_COLLECTION_PREFIX + table_name (db_id)
 
 def _suggest_semantic_columns(df_head: pd.DataFrame, schema: dict, table_name: str, llm_wrapper) -> list[str]:
     """Uses LLM to suggest semantic columns. Needs the schema for the specific table."""
@@ -1313,40 +1299,9 @@ def process_natural_language_query(
         else:
             logging.warning("`db_samples_for_selection` not provided to `process_natural_language_query`. Sample quality for DB selection might be reduced.")
             # LLM will select based on schemas only if samples are missing.
-
-        # Format context (schemas + samples) for the selection prompt
-        # full_schema is {db_id: {table:cols}, ...}
-        # format_context_for_db_selection expects {db_id: [cols]} for its `available_schemas`
-        # We need to adapt or pass a simplified schema view for selection if it expects flat [cols] per db_id.
-        # The current `format_context_for_db_selection` takes {db_id: {"columns": [cols], "sample": str}} which is fine.
-        # It seems `select_database_id` expects `schemas_json` to be string dump of this.
-        # `full_schema` is already structured as {db_id: schema_dict_for_db_id}.
-        # `format_context_for_db_selection` is more about formatting a string.
-        # `select_database_id` takes `schema_and_samples` (a dict) and `available_db_ids`.
-        # Let's construct `schema_and_samples_for_select_prompt` directly for `select_database_id`
-        
+       
         schema_and_samples_for_select_prompt_dict = {}
         for db_id_key, single_db_schema_val in full_schema.items():
-            # single_db_schema_val is {table_name: [cols], ...}
-            # We need to represent this in a way `select_database_id` prompt understands.
-            # The prompt `select_database_id` expects `schemas_json` which is a dump of
-            # { db_id: { "columns": [col1, col2, ...], "sample_data_snippet": str|None }, ... }
-            # The "columns" here should ideally be a representation of all tables and columns.
-            
-            # Let's simplify: the prompt for `select_database_id` likely just wants a string representation
-            # of the schema for each db_id.
-            
-            # The `format_context_for_db_selection` creates this structure from a simpler input.
-            # Let's use it as intended:
-            # `available_schemas_for_formatter = {db_id: list_of_all_cols_in_db_id_for_simplicity}`
-            # Or, `available_schemas_for_formatter = full_schema` if format_context understands it.
-            # Looking at format_context_for_db_selection, it expects `available_schemas: Dict[str, List[str]]`
-            # which means db_id -> list of columns (flat, not per table). This might be a simplification in that helper.
-            
-            # For now, let's assume `select_database_id`'s prompt handles `schemas_json` derived from
-            # `full_schema` (which is `{db_id: {table:cols}}`) and `effective_db_samples_for_select_prompt`.
-            # The prompt might iterate `db_id: schema_info_dict` from `schemas_json`.
-            # Let's build what `select_database_id` expects for its `schema_and_samples` argument.
             db_context_for_selection = {}
             for db_id_sel, schema_dict_sel in full_schema.items():
                 # Create a string summary of tables and columns for "columns" field
@@ -1433,13 +1388,7 @@ def process_natural_language_query(
     if result["determined_route"] == "SQL":
         start_time_gen_sql = time.perf_counter()
         logging.info("Pipeline: Generating SQL Query...")
-        # _generate_sql_query is called within execute_sql_pipeline, so no direct call here needed if using the full pipeline.
-        # However, for benchmark_nl.py, we need generated_sql even if conn is None or if execution fails.
-        # So, we might need a distinct generation step.
-        # The current `process_natural_language_query` was structured to generate SQL first, then execute.
-        
-        # Let's keep the structure: generate SQL first, then decide on execution.
-        # This `generated_sql_string` is the attempt before any retries from `execute_sql_pipeline`.
+
         generated_sql_string = _generate_sql_query(
             user_query=result["refined_query"],
             schema=schema_for_sql_and_refine,
@@ -1498,10 +1447,7 @@ def process_natural_language_query(
     start_time_exec = time.perf_counter()
 
     if result["determined_route"] == "SQL":
-        # `conn` here is crucial. For benchmark_nl.py, it's the connection to the *actual* DB.
-        # If `selected_db_id_by_llm` is different, `execute_sql_pipeline` will try to run SQL
-        # (generated for `selected_db_id_by_llm`'s schema) on `conn` (for `actual_db_id`).
-        # This will likely fail, which is the desired behavior to penalize wrong DB selection.
+
         sql_pipeline_outcome = execute_sql_pipeline(
             user_query=result["refined_query"],
             selected_db_schema=schema_for_sql_and_refine, # Schema for LLM's choice
@@ -1520,7 +1466,7 @@ def process_natural_language_query(
         )
 
     # Execute secondary route if primary failed
-    # Note: Pass the *results* from the primary attempt to run_secondary_route
+
     sql_final_result, semantic_final_result = run_secondary_route(
         user_query=result["refined_query"], # refined query for secondary route too
         primary_route=result["determined_route"],
@@ -1593,9 +1539,6 @@ def process_natural_language_query(
 # --- Data Processing Function (Handles Upload/GSheet -> SQLite -> Qdrant) ---
 def process_uploaded_data(uploaded_file, gsheet_published_url, table_name, conn, llm_wrapper, aux_models, qdrant_client, replace_confirmed=False):
     """Reads data, writes to SQLite, analyzes, embeds, indexes."""
-    # (Implementation mostly the same as provided - includes robust column cleaning and detailed logging)
-    # Ensure it uses the MODIFIED _suggest_semantic_columns and _embed_and_index_data
-    # which now expect the table_name/db_id for context/collection naming.
 
     # --- Initial checks ---
     start_time = time.time()
