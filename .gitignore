@@ -188,3 +188,4 @@ temp.py
 *.txt
 tabular_chat_local_llm.ipynb:Zone.Identifier
 /models
+/benchmark/benchmark_v2.py
