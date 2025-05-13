@@ -1,21 +1,41 @@
 # LocalTabula: Natural Language Tabular Data Assistant
 
-[![Python Version](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)  
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+ 
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPLv3-yellow.svg)](https://www.gnu.org/licenses/gpl-3.0.en.html)
 
-# LocalTabula: Your Local-First Tabular Data Assistant
+
 
 **LocalTabula** is a Streamlit app that transforms your spreadsheets into an interactive chat—right on your machine. Drop in an Excel file or a published Google Sheet CSV, then ask questions in plain English. No cloud services, no data leaks: everything runs locally, powered by SQLite and an in‑memory Qdrant vector store.
 
 ---
 
-## Why Local First?
+**Why Go Local in an Era of Super-Smart API LLMs?**
 
-Many “chat-to-data” tools live in the cloud and hide their inner workings behind rigid UIs. LocalTabula flips the script:
+Sure, API-driven powerhouses like ChatGPT or Claude can nail SQL generation, and many cloud tools out-of-the-box boast precision that dwarfs lightweight local models. But if you care about privacy, predictability, customization—and even stretching a small budget—local-first is the only way to guarantee your data stays under your control and your costs stay capped.
 
-* **Full Ownership:** Your data never leaves your computer.
-* **Customizable Pipeline:** Tweak prompts, swap models, and tune indexing to fit your needs.
-* **Multi-Stage Architecture:** Each step validates and refines, so you get accurate, explainable results.
+1. **Data Sovereignty & Compliance**
+   Keep everything on-premises so your sensitive data never leaves your firewall. No matter how ironclad an API’s security may sound, nothing beats zero-network-egress for GDPR, HIPAA, or strict corporate policies.
+
+2. **Cost Predictability**
+   Ditch per-token billing and surprise overages. After your one-time investment in modest hardware, inference is essentially free—run queries all day without ever watching a meter.
+
+3. **Latency & Reliability**
+   Get consistent responses with no reliance on internet connectivity or external service uptime. LocalTabula even thrives in air-gapped or low-bandwidth environments.
+
+4. **Budget-Friendly Hardware**
+   Designed for modest rigs: offload a 4-bit–quantized Gemma3-4B model onto a 4 GB GPU, keep the 1.3 B SQL model on CPU, and voilà—you’ve unlocked powerful local inference without a datacenter.
+
+5. **Tunable Accuracy with Compact Models**
+   Yes, a 1.3 B-parameter GGUF model might hit \~90% accuracy on straightforward Spider queries—but plunge into nuanced, conversational questions and accuracy can plummet to \~30%. That’s why LocalTabula’s multi-stage pipeline leans heavily on prompt engineering: editable templates, few-shot examples, retry loops, and error-feedback prompts. With those knobs, you’ll guide even a budget-friendly model to production-grade performance.
+
+6. **Full Customization & Extensibility**
+   Control every prompt, swap in the latest open-source weights, tweak retry logic, or layer on RAG/agent workflows. You own the roadmap—no vendor lock-in, no forced upgrades.
+
+---
+
+**In Short:** If your top priorities are privacy, predictability, customization—and wringing real accuracy out of small, budget-friendly models—going local isn’t just an option; it’s the only way to keep your data policies—and your wallet—in check. LocalTabula makes it easy to get up and running, even on humble hardware.
+
+
 
 ---
 
@@ -38,7 +58,7 @@ Many “chat-to-data” tools live in the cloud and hide their inner workings be
    Choose SQL or semantic mode based on your question’s structure. Attach the relevant table’s schema and a few sample rows to guide the LLM.
 
 3. **Prompt Refinement (Optional)**
-   An LLM polishes your query into a tightly defined SQL prompt. Great for non-experts—skip it if you prefer writing your own SQL.
+   An LLM polishes your query into a tightly defined SQL prompt. Great for non-experts—skip it if you prefer writing your own query.
 
 4. **Execution & Fallback**
 
@@ -60,12 +80,15 @@ All configurations live in **`.env`**, **`config/prompts.yaml`**, and the helper
 | Language Normalizer  | `prompts.yaml`                            | Swap translation logic or disable                      |
 | DB Selection         | `select_database_id` / `prompts.yaml`     | Change sample size, prompt template, or fallback logic |
 | Refinement & Routing | `refine_and_select` / `prompts.yaml`      | Adjust few-shots, temperature, or force-mode flags     |
-| SQL Generation       | `generate_sql_*` / `aux_models`           | Swap GGUF models, tweak examples, or retry logic       |
+| SQL Generation       | `generate_sql_*` / `aux_models`           | Swap NL-SQL models, tweak examples, or retry logic       |
 | SQL Execution        | `utils._execute_sql_query`                | Modify DB path, pragmas, or timeouts                   |
 | Semantic Search      | `init_qdrant_client` / `aux_models`       | Change embedding model, top-k, or distance metric      |
 | Summary              | `generate_final_summary` / `prompts.yaml` | Edit tone, detail level, or skip entirely              |
 
 ---
+During development, I wrapped the core LLM logic in `LLMWrapper`, letting you switch between a local model or an API-based model (via OpenRouter) by calling `LLMWrapper.mode()` and setting the `OPENROUTER_API_KEY` and `OPENROUTER_MODEL_NAME` environment variables.
+
+
 
 ## Getting Started
 
@@ -82,7 +105,11 @@ All configurations live in **`.env`**, **`config/prompts.yaml`**, and the helper
    pip install -r requirements.txt
    ```
 
-   For GPU support, reinstall `llama-cpp-python` with proper CMake flags.
+   ⚠️ **GPU Support Requires Advanced Setup**
+
+
+    You’ll need to build `llama-cpp-python` with the appropriate CMake flags—a nontrivial process. See the README in the **config** folder for some guidance.
+
 
 3. **Configure**
    Copy `.env.example` to `.env` and set:
@@ -101,6 +128,16 @@ All configurations live in **`.env`**, **`config/prompts.yaml`**, and the helper
 
 ---
 
-For GPU support, read the README file under config folder
 
-**Work in Progress:** The core pipeline is stable, but the UI and settings panel are evolving. Contributions and feedback are welcome—this is your homegrown tool!
+
+## **Work in Progress**
+2025.05.13
+
+1. **UI & Settings Panel**
+   The core pipeline is stable, but the interface remains basic. A dedicated settings page for tweaking prompts and parameters (e.g., retry counts, max tokens) is coming soon.
+
+2. **SQL Command Editor**
+   We’re adding an interactive SQL console so you can write and run custom queries alongside the automated pipeline.
+
+3. **Google Colab Support**
+   There’s an experimental `main.ipynb` for Colab, with ngrok tunneling to expose the Streamlit app. Because Colab currently runs CUDA 12.5, GPU setup can be tricky—if you plan to use Colab, we recommend the 8B llama-3.1 model for smooth performance.
