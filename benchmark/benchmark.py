@@ -138,7 +138,7 @@ def compare_results(gold_results: Optional[Set[Tuple]], gen_results: Optional[Se
     return gold_results == gen_results
 
 # Helper for multi-table sampling (consistent with benchmark_nl.py's helper)
-def _get_multi_table_sample_str_for_benchmark( # Renamed slightly for clarity
+def _get_multi_table_sample_str_for_benchmark( 
     db_id_for_log: str, # Used for logging context
     db_schema_dict: Dict[str, List[str]], # Schema for this specific db_id {table: [cols]}
     db_conn: sqlite3.Connection,

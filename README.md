@@ -15,26 +15,28 @@
 Sure, API-driven powerhouses like ChatGPT or Claude can nail SQL generation, and many cloud tools out-of-the-box boast precision that dwarfs lightweight local models. But if you care about privacy, predictability, customization—and even stretching a small budget—local-first is the only way to guarantee your data stays under your control and your costs stay capped.
 
 1. **Data Sovereignty & Compliance**
-   Keep everything on-premises so your sensitive data never leaves your firewall. No matter how ironclad an API’s security may sound, nothing beats zero-network-egress for GDPR, HIPAA, or strict corporate policies.
+   Run everything on-premises so sensitive tables never leave your firewall. No vendor promise can beat zero-network-egress for GDPR, HIPAA, or corporate-policy peace of mind.
 
 2. **Cost Predictability**
-   Ditch per-token billing and surprise overages. After your one-time investment in modest hardware, inference is essentially free—run queries all day without ever watching a meter.
+   Say goodbye to per-token billing and surprise overages. One up-front investment in modest hardware (even a budget GPU) gives you essentially free inference from then on.
 
 3. **Latency & Reliability**
-   Get consistent responses with no reliance on internet connectivity or external service uptime. LocalTabula even thrives in air-gapped or low-bandwidth environments.
+   Local inference delivers consistent sub-second* responses—no internet required, no service-downtime worries. Perfect for air-gapped or low-bandwidth environments. 
+
+   (*provided you have decent hardware)
 
 4. **Budget-Friendly Hardware**
-   Designed for modest rigs: offload a 4-bit–quantized Gemma3-4B model onto a 4 GB GPU, keep the 1.3 B SQL model on CPU, and voilà—you’ve unlocked powerful local inference without a datacenter.
+   Offload a 4-bit–quantized Gemma3-4B to a 4 GB GPU, run the 1.3 B SQL model on CPU, and voilà—powerful LLM inference without a data center.
 
-5. **Tunable Accuracy with Compact Models**
-   Yes, a 1.3 B-parameter GGUF model might hit \~90% accuracy on straightforward Spider queries—but plunge into nuanced, conversational questions and accuracy can plummet to \~30%. That’s why LocalTabula’s multi-stage pipeline leans heavily on prompt engineering: editable templates, few-shot examples, retry loops, and error-feedback prompts. With those knobs, you’ll guide even a budget-friendly model to production-grade performance.
+5. **State-of-the-Art, Unhosted Models**
+   As of May 2025, [a compact 3 B-parameter SQL model](https://huggingface.co/mradermacher/XiYanSQL-QwenCoder-3B-2504-GGUF) reportedly outperform API-hosted giants like GPT-4o and Sonnet 3.7 on various benchmarks. If you want to try these SOTA models, local inference is not just an option—it’s often the only way to access their cutting-edge performance.
 
 6. **Full Customization & Extensibility**
-   Control every prompt, swap in the latest open-source weights, tweak retry logic, or layer on RAG/agent workflows. You own the roadmap—no vendor lock-in, no forced upgrades.
+   A budget-friendly 1.3 B model can hit ~80 % accuracy on straightforward queries, but drop to ~30 % on nuanced questions without careful prompts. **LocalTabula’s**  multi-stage pipeline—editable templates, few-shot examples, retry loops, and feedback prompts—lets you dial in production-grade results. Control every prompt, swap in the latest open-source weights, tweak retry logic, or layer on RAG/agent workflows. You own the roadmap—no vendor lock-in, no forced upgrades.
 
 ---
 
-**In Short:** If your top priorities are privacy, predictability, customization—and wringing real accuracy out of small, budget-friendly models—going local isn’t just an option; it’s the only way to keep your data policies—and your wallet—in check. LocalTabula makes it easy to get up and running, even on humble hardware.
+**In Short:** If you need ironclad privacy, fixed costs, deep customization—and access to the very latest unhosted models—going local isn’t just an alternative; it’s the only way to keep both your data policies and your wallet intact. **LocalTabula** makes it possible—even on humble hardware.
 
 
 
@@ -48,12 +50,32 @@ Sure, API-driven powerhouses like ChatGPT or Claude can nail SQL generation, and
 * **Inspect & Tweak:** Expand SQL statements, preview raw rows or embeddings, and re-index on demand.
 * **Offline or API:** During development, point to OpenRouter; in production, run purely local GGUF models (with optional GPU acceleration).
 
----
-![alt text](images/image.png)
-Data jobs in Vietnam
+## Testing examples
 
-![alt text](images/image-2.png)
-Car sales dataset: [Kaggle](https://www.kaggle.com/datasets/jainaru/electric-car-sales-2010-2024?resource=download)
+### 🚀 Vietnam Data Jobs (Proprietary Dataset)
+
+![Vietnam Data Jobs](images/image.png)
+
+**Question:** What are the top 10 job titles?
+
+---
+
+### 🚗 Car Sales Dataset
+
+![Car Sales](images/image-2.png)
+
+Source: [Kaggle – Car Sales](https://www.kaggle.com/datasets/jainaru)
+
+**Test:** Simple data retrieval  
+**Question:** What is the proportion of BEV car sales in Australia in 2015?
+
+---
+
+![alt text](images/image-3.png)
+
+**Test:** Trend analysis  
+**Question:** What is the trend of BEV car sales over the years?
+
 
 ## Under the Hood: The 5-Stage Query Pipeline
 
@@ -94,6 +116,17 @@ All configurations live in **`.env`**, **`config/prompts.yaml`**, and the helper
 ---
 During development, I wrapped the core LLM logic in `LLMWrapper`, letting you switch between a local model or an API-based model (via OpenRouter) by calling `LLMWrapper.mode()` and setting the `OPENROUTER_API_KEY` and `OPENROUTER_MODEL_NAME` environment variables.
 
+## Why Go Dual Models?
+
+Offloading the SQL generator to your CPU while dedicating GPU power to a larger orchestration model unlocks several advantages:
+
+- **Efficient Resource Use:** Compact SQL models (1–3 B parameters) can deliver solid performance on CPU + RAM, leaving your GPU free for a heftier, better reasoning LLM that orchestrates query refinement and translation.
+
+- **Budget-Friendly Hardware:** This split lets you run entirely on a low‑end machine (e.g. 4 GB VRAM GPU + standard CPU) without sacrificing throughput.
+
+- **Language Coverage:** Most SQL-specific models aren’t trained for multilingual input. By pairing them with a stronger “front‑end” model to normalize and translate queries, you get better results across languages.
+
+This dual‑model setup maximizes your hardware, ensures each model handles what it does best, and keeps everything local and cost‑effective.
 
 
 ## Getting Started

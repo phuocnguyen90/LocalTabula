@@ -33,7 +33,9 @@ thì chạy local vẫn là lựa chọn duy nhất đảm bảo dữ liệu n�
 
 5. **Chỉnh Độ Chính Xác Với Model Nhỏ**
 
-   Theo thử nghiệm lý thuyết Với pip-sql-1.3b, bạn dễ dàng đạt ~90% chính xác trên các câu hỏi cơ bản, nhưng khi vào phần hỏi lắt léo (và bầng tiếng Việt), độ chính xác có thể thấp hơn rất nhiều. LocalTabula giải quyết bằng pipeline đa giai đoạn cùng prompt engineering—template thoải mái sửa, few-shot, retry loop, feedback prompt—để “vỗ” model nhỏ thành công cụ mạnh mẽ.
+   Theo thử nghiệm lý thuyết Với pip-sql-1.3b, bạn dễ dàng đạt ~80% chính xác trên các câu hỏi cơ bản, nhưng khi vào phần hỏi lắt léo (và bầng tiếng Việt), độ chính xác có thể thấp hơn rất nhiều. LocalTabula giải quyết bằng pipeline đa giai đoạn cùng prompt engineering—template thoải mái sửa, few-shot, retry loop, feedback prompt—để “vỗ” model nhỏ thành công cụ mạnh mẽ.
+
+   Ngoài ra, kết quả benchmark cho thấy một số model như [XiYanSQL 3B](https://huggingface.co/mradermacher/XiYanSQL-QwenCoder-3B-2504-GGUF) hoạt động thậm chí còn tốt hơn các mô hình lớn qua API như GPT-4o và Sonnet 3.7.
 
 6. **Tùy Biến & Mở Rộng**
 
@@ -55,11 +57,30 @@ thì chạy local vẫn là lựa chọn duy nhất đảm bảo dữ liệu n�
 
 ---
 ## Hình minh họa
-![alt text](images/image.png)
-Data jobs in Vietnam
 
-![alt text](images/image-2.png)
-Car sales dataset: [Kaggle](https://www.kaggle.com/datasets/jainaru/electric-car-sales-2010-2024?resource=download)
+### 🚀 Vietnam Data Jobs (Proprietary Dataset)
+
+![Vietnam Data Jobs](images/image.png)
+
+**Question:** What are the top 10 job titles?
+
+---
+
+### 🚗 Car Sales Dataset
+
+![Car Sales](images/image-2.png)
+
+Source: [Kaggle – Car Sales](https://www.kaggle.com/datasets/jainaru)
+
+**Test:** Simple data retrieval  
+**Question:** What is the proportion of BEV car sales in Australia in 2015?
+
+---
+
+![alt text](images/image-3.png)
+
+**Test:** Trend analysis  
+**Question:** What is the trend of BEV car sales over the years?
 
 
 ## Hoạt Động Bên Trong: Pipeline 5 Giai Đoạn
@@ -145,4 +166,4 @@ Tất cả nằm trong **`.env`**, **`config/prompts.yaml`**, và **`utils.py`**
    Thêm console SQL tương tác để bạn tự viết và chạy truy vấn song song với pipeline tự động.
 
 3. **Hỗ Trợ Google Colab**
-   Có notebook `main.ipynb` thử nghiệm, dùng ngrok để expose Streamlit. Colab chạy CUDA 12.5 nên cấu hình GPU hơi lằng nhằng—nếu dùng Colab, khuyến nghị model llama-3.1 8B để mượt mà hơn.
+   Trong repo có file notebook `main.ipynb` đang thử nghiệm, dùng ngrok để expose Streamlit. Tuy nhiên Colab chạy CUDA 12.5 nên cấu hình GPU hơi phức tạp—nếu dùng Colab, khuyến nghị các model có kiến trúc cũ hơn như llama-3.1 8B.
