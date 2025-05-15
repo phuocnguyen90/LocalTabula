@@ -4,7 +4,7 @@ import logging
 from fastembed import TextEmbedding
 from pathlib import Path 
 from dotenv import load_dotenv
-import torch
+# import torch
 # Import ENV_PATH from .utils (sibling module in the same package)
 from utils.utils import ENV_PATH
 
@@ -16,7 +16,18 @@ except ImportError:
     llama_cpp_available_for_aux = False
     # logging.warning is configured below, so it's fine
     # print("Warning: llama_cpp library not found. Cannot load GGUF SQL model.")
+# --- pynvml for VRAM check and GPU availability ---
 
+try:
+    import pynvml
+    pynvml_available_aux = True
+    pynvml.nvmlInit() # Initialize NVML once per module import (or globally)
+except ImportError:
+    pynvml_available_aux = False
+    logging.info("pynvml not available in aux_model, GPU detection and VRAM checks will be limited.")
+except pynvml.NVMLError as e:
+    pynvml_available_aux = False # Treat init error as unavailable
+    logging.warning(f"pynvml initialization error in aux_model: {e}. GPU features might be impacted.")
 
 # --- Load Environment Variables ---
 if ENV_PATH.exists():
@@ -34,8 +45,38 @@ logging.basicConfig(
 if not llama_cpp_available_for_aux: # Log after basicConfig
     logging.warning("llama_cpp library not found. Cannot load GGUF SQL model.")
 
+def is_gpu_available_pynvml() -> bool:
+    """Checks if any NVIDIA GPU is accessible via pynvml."""
+    if not pynvml_available_aux:
+        return False
+    try:
+        # pynvml.nvmlInit() # Already initialized at module level
+        device_count = pynvml.nvmlDeviceGetCount()
+        return device_count > 0
+    except pynvml.NVMLError:
+        return False
+    # finally:
+        # pynvml.nvmlShutdown() # Shutdown if you init/shutdown per call
 
-def load_aux_models() -> dict:
+def get_free_gpu_memory_mb_aux(device_index: int = 0) -> int:
+    """Returns free GPU memory in MiB, or -1 on failure."""
+    if not pynvml_available_aux or not is_gpu_available_pynvml(): # Check if GPU even present
+        return -1
+    try:
+        # pynvml.nvmlInit() # Already initialized
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+        info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        free_mb = info.free // (1024**2)
+        # total_mb = info.total // (1024**2) # If you need total for logging
+        # logging.debug(f"GPU-{device_index} (aux_model): Free VRAM: {free_mb} MiB / Total: {total_mb} MiB")
+        return free_mb
+    except pynvml.NVMLError: # Catch specific pynvml errors
+        return -1
+    # finally:
+        # pynvml.nvmlShutdown()
+
+
+def load_aux_models(available_vram_mb: int = -1) -> dict:
     """
     Loads auxiliary models: SQL Generator (GGUF) and Embedder.
     Assumes models are pre-downloaded by scripts/download_models.py.
@@ -55,6 +96,8 @@ def load_aux_models() -> dict:
             models["sql_load_error"] = "SQL LLM path not configured."
         else:
             sql_model_path = Path(sql_model_path_str)
+            sql_model_size_mb = sql_model_path.stat().st_size / (1024**2)
+            logging.info(f"SQL LLM GGUF file size: {sql_model_size_mb:.1f} MiB")
             if not sql_model_path.exists():
                 logging.error(f"SQL LLM GGUF file not found at: {sql_model_path}. Run scripts/download_models.py.")
                 models["sql_load_error"] = f"SQL LLM file not found at {sql_model_path}."
@@ -63,22 +106,18 @@ def load_aux_models() -> dict:
                 use_cpu = use_cpu_str in ("true", "1", "t", "y", "yes")
 
                 sql_n_gpu_layers = 0
-                if not torch.cuda.is_available():
-                    use_cpu = True # Force CPU
-                
+                gpu_system_available = is_gpu_available_pynvml() 
                 if use_cpu:
-                    logging.info("SQL_LLM_USE_CPU is true or no GPU; loading SQL LLM on CPU.")
+                    logging.info("SQL_LLM_USE_CPU is true; loading SQL LLM on CPU.")
+                    sql_n_gpu_layers = 0
+                elif not gpu_system_available:
+                    logging.info("No GPU detected by pynvml; loading SQL LLM on CPU.")
                     sql_n_gpu_layers = 0
                 else:
+                    logging.info("GPU detected by pynvml; loading SQL LLM on GPU.")
                     try:
                         sql_n_gpu_layers_str = os.getenv("SQL_LLM_N_GPU_LAYERS", "-1")
                         sql_n_gpu_layers = int(sql_n_gpu_layers_str)
-                        # Optional: Add VRAM check here if you want to dynamically adjust layers
-                        # free_vram_mb = get_free_gpu_memory_mb()
-                        # model_size_mb = sql_model_path.stat().st_size / (1024**2)
-                        # if free_vram_mb < model_size_mb * 1.2 and sql_n_gpu_layers != 0: # Rough estimate
-                        #    logging.warning(f"Low VRAM ({free_vram_mb}MB) for SQL model ({model_size_mb:.1f}MB). Forcing to CPU.")
-                        #    sql_n_gpu_layers = 0
                     except ValueError:
                         logging.warning(f"Invalid value for SQL_LLM_N_GPU_LAYERS: '{sql_n_gpu_layers_str}'. Defaulting to -1.")
                         sql_n_gpu_layers = -1
@@ -94,7 +133,7 @@ def load_aux_models() -> dict:
                 logging.info(f"SQL LLM GGUF n_ctx={sql_n_ctx}")
                 
                 try:
-                    vram_before = torch.cuda.memory_allocated(0) if torch.cuda.is_available() and not use_cpu else 0
+                    vram_before_sql_load_aux_mb = get_free_gpu_memory_mb_aux() if sql_n_gpu_layers != 0 and gpu_system_available else -1
                     logging.info(f"Loading SQL LLM GGUF model from: {sql_model_path}")
                     models["sql_gguf_model"] = Llama(
                         model_path=str(sql_model_path),
@@ -104,10 +143,10 @@ def load_aux_models() -> dict:
                     )
                     sql_model_loaded = True
                     logging.info("SQL LLM (local GGUF) loaded successfully.")
-                    if torch.cuda.is_available() and not use_cpu and vram_before is not None:
-                        vram_after = torch.cuda.memory_allocated(0)
-                        delta = (vram_after - vram_before) / (1024**2)
-                        logging.info(f"VRAM after SQL LLM load: {vram_after/1024**2:.1f} MiB  (Δ {delta:.1f} MiB)")
+                    
+                    vram_after = get_free_gpu_memory_mb_aux()
+                    delta = (vram_after - vram_before_sql_load_aux_mb) / (1024**2)
+                    logging.info(f"VRAM after SQL LLM load: {vram_after/1024**2:.1f} MiB  (Δ {delta:.1f} MiB)")
                 except Exception as e:
                     logging.error(f"Error loading SQL LLM GGUF model: {e}", exc_info=True)
                     models["sql_load_error"] = f"Load error: {e}"

@@ -4,24 +4,23 @@ import pandas as pd
 import os
 import time
 import logging
-import torch
-torch.classes.__path__ = [] # Clear the path to avoid loading Torch classes
+# import torch
+# torch.classes.__path__ = [] # Clear the path to avoid loading Torch classes
 
 # Import functions from utils.py
 from utils.utils import (
-    setup_environment, get_db_connection, init_qdrant_client, get_llm_wrapper,
-    get_cached_aux_models, get_schema_info, process_uploaded_data,
+    setup_environment, get_schema_info, process_uploaded_data,
     process_natural_language_query, table_exists,
     get_sqlite_table_row_count, get_qdrant_collection_info,
     reindex_table, delete_table_data,
     derive_requirements_from_history,
-    QDRANT_COLLECTION_PREFIX,
-    get_llm_wrapper, get_cached_aux_models
+    get_db_connection, init_qdrant_client, get_all_model_resources,
+    QDRANT_COLLECTION_PREFIX
 )
-
 
 # --- Config Logging & Filter ---
 
+# --- Setup Environment and Database Path ---
 # --- Setup Environment and Database Path ---
 DB_PATH = setup_environment()
 if not DB_PATH:
@@ -32,46 +31,74 @@ if not DB_PATH:
 db_conn = get_db_connection(DB_PATH)
 qdrant_client = init_qdrant_client()
 
-# Use the new cached functions for models
-
-llm_wrapper = get_llm_wrapper()
-aux_models = get_cached_aux_models()
-
-
-
-
-# --- Check if GPU is available ---
-if torch.cuda.is_available():
-    logging.info("GPU is available.")
-else:
-    logging.info("GPU is not available. Using CPU.")
-
-
-
+# Initialize All Models via ModelResources
+# Pass force_verbose=True for detailed llama.cpp logs during debugging GPU issues
+# model_resources = get_all_model_resources(force_verbose=True) 
+model_resources = get_all_model_resources() # Standard run
 
 # --- Perform Readiness Checks ---
-
-aux_models_ready = isinstance(aux_models, dict) and aux_models.get("status") == "loaded"
 db_ready = db_conn is not None
 qdrant_ready = qdrant_client is not None
-llm_ready = llm_wrapper and llm_wrapper.is_ready
-aux_models_ready = aux_models and aux_models.get("status") == "loaded"
 
-# Processing requires DB, Qdrant, Embedder(Aux), optionally LLM for column suggestions
-processing_resources_ok = db_ready and qdrant_ready and aux_models_ready  # Add llm_ready if needed
-# Chat requires DB, Qdrant, LLM, Aux (SQL/Embedder)
-core_resources_ok = db_ready and qdrant_ready and llm_ready and aux_models_ready
+# Access models and their readiness from the model_resources object
+main_llm_ready = (model_resources.main_llm_wrapper is not None and
+                  model_resources.main_llm_wrapper.is_ready)
 
-# Provide User Feedback on Readiness
+sql_model_ready = model_resources.sql_gguf_model is not None
+embedding_model_ready = model_resources.embedding_model is not None
+
+# Define overall readiness based on these individual checks
+all_models_loaded_status = model_resources.status == "loaded_all" # True if all components within ModelResources loaded fine
+
+# **Redefined processing_resources_ok and core_resources_ok**
+
+# For Data Processing (uploading, indexing new tables):
+# - Needs DB connection (to write SQLite table).
+# - Needs Qdrant client (to create/update vector collections).
+# - Needs Embedding model (to create vectors).
+# - Needs Main LLM (LLMWrapper) for semantic column suggestion (_suggest_semantic_columns).
+processing_resources_ok = (
+    db_ready and
+    qdrant_ready and
+    embedding_model_ready and
+    main_llm_ready # Main LLM is used for suggesting semantic columns
+)
+
+# For Core Chat Functionality:
+# - Needs DB connection (to execute SQL queries).
+# - Needs Qdrant client (for semantic search).
+# - Needs Main LLM (LLMWrapper) for understanding query, routing, summarization.
+# - Needs SQL GGUF model (for SQL generation).
+# - Needs Embedding model (for semantic search query vectorization).
+core_resources_ok = (
+    db_ready and
+    qdrant_ready and
+    main_llm_ready and
+    sql_model_ready and
+    embedding_model_ready
+)
+# Alternatively, you could use the overall status from ModelResources if it's comprehensive enough:
+# core_resources_ok = db_ready and qdrant_ready and all_models_loaded_status
+
+# --- Provide User Feedback on Readiness ---
 if not core_resources_ok:
-    st.warning("Core resources (DB, Qdrant, LLM, Models) are not fully loaded. Chat functionality may be limited or unavailable.", icon="⚠️")
-    # Be more specific if possible
+    st.warning("Core resources are not fully loaded. Chat functionality may be limited or unavailable.", icon="⚠️")
+    # Be more specific
     if not db_ready: st.error("Database connection failed.")
     if not qdrant_ready: st.error("Qdrant vector store failed to initialize.")
-    if not llm_ready: st.error("LLM wrapper failed to initialize or model not loaded.")
-    if not aux_models_ready:
-        err = aux_models.get('error_message', 'Check logs') if isinstance(aux_models, dict) else "Models dict not loaded"
-        st.error(f"Auxiliary models (Embedder/SQL) failed to load: {err}")
+    if not main_llm_ready:
+        st.error(f"Main LLM failed to initialize. Error: {model_resources.error_messages.get('main_llm', 'Unknown LLMWrapper issue')}")
+    if not sql_model_ready:
+        st.error(f"SQL GGUF model failed to load. Error: {model_resources.error_messages.get('sql_llm', 'Unknown SQL GGUF issue')}")
+    if not embedding_model_ready:
+        st.error(f"Embedding model failed to load. Error: {model_resources.error_messages.get('embedding', 'Unknown embedding issue')}")
+    # You can also show the general model_resources.error_messages if any
+    if model_resources.status != "loaded_all" and model_resources.error_messages:
+        st.caption(f"Overall model loading issues: {model_resources.error_messages}")
+
+llm_wrapper=model_resources.main_llm_wrapper
+aux_models=[model_resources.sql_gguf_model,model_resources.embedding_model]
+
 
 # --- Initialize Session State ---
 if "messages" not in st.session_state:
@@ -480,7 +507,7 @@ with tab_data_manage:
 
 
                 with col2_manage: # Re-index
-                    reindex_disabled = not (processing_resources_ok and llm_ready)
+                    reindex_disabled = not (processing_resources_ok and main_llm_ready)
                     if st.button(f"🔄 Re-index Vectors", key=f"reindex_{selected_table}", help="Re-calculates and replaces vector embeddings for this table using current models.", disabled=reindex_disabled):
                         with st.spinner(f"Re-indexing '{selected_table}'... This may take time."):
                             # Ensure aux_models format before calling

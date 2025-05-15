@@ -41,11 +41,8 @@ EMBEDDING_SUBDIR_IN_AUX = AUX_MODELS_SUBDIR / "embedding_cache"
 ENV_PATH = CONFIG_DIR / ".env"
 load_dotenv(dotenv_path=str(ENV_PATH))  
 MAX_SCHEMA_CHARS_ESTIMATE = 20000 # Rough estimate for prompt length control
-
-
-# --- Import your model loading functions ---
-from .llm_interface import LLMWrapper  # Assuming llm_interface.py is in utils/
-from .aux_model import load_aux_models # Assuming aux_model.py is in utils/
+# Import the new ModelResources class
+from .resources import ModelResources
 
 # --- Load Prompts ---
 def load_prompts():
@@ -101,31 +98,7 @@ def setup_environment():
         logging.error(f"An unexpected error occurred during environment setup: {e}", exc_info=True)
         return None
 
-
 # --- Cached Resource Initializers ---
-@st.cache_resource
-def get_llm_wrapper():
-    
-    logging.info("Attempting to get/initialize LLMWrapper (cached)...")
-    # LLMWrapper itself will load .env using ENV_PATH from this module
-    wrapper = LLMWrapper()
-    if not wrapper.is_ready:
-        logging.error("LLMWrapper initialization failed (cached call).")
-    else:
-        logging.info("LLMWrapper initialized successfully (cached call).")
-    return wrapper
-
-@st.cache_resource
-def get_cached_aux_models():
-    logging.info("Attempting to get/initialize Auxiliary Models (cached)...")
-    # load_aux_models itself will load .env using ENV_PATH from this module
-    models_dict = load_aux_models()
-    if models_dict.get('status') != 'loaded':
-         logging.warning(f"Aux model loading status (cached call): {models_dict.get('status')}. Error: {models_dict.get('error_message', 'N/A')}")
-    else:
-        logging.info("Auxiliary models loaded successfully (cached call).")
-    return models_dict
-
 @st.cache_resource
 def get_db_connection(db_path):
     """Establishes and caches SQLite connection."""
@@ -144,6 +117,7 @@ def get_db_connection(db_path):
         return None
 
 QDRANT_FILENAME = "qdrant_storage"
+
 
 @st.cache_resource
 def init_qdrant_client() -> QdrantClient | None:
@@ -192,7 +166,28 @@ def init_qdrant_client() -> QdrantClient | None:
         logging.fatal(f"Could not initialize in-memory Qdrant: {e}", exc_info=True)
         return None
 
+@st.cache_resource
+def get_all_model_resources(force_verbose: bool = False) -> ModelResources:
+    """
+    Initializes and caches an instance of ModelResources,
+    which handles loading all LLMs and embedding models.
+    The `force_verbose` flag can be used during debugging to get detailed
+    llama.cpp logs for specific model loads, even if the global
+    LLAMA_CPP_VERBOSE env var isn't set for all loads.
+    """
+    logging.info("Attempting to get/initialize All Model Resources (cached)...")
+    # Pass force_verbose if you want to debug Llama.cpp loading for all models
+    # loaded via this resources class.
+    resources = ModelResources(force_verbose_llms=force_verbose)
+    if resources.status != "loaded_all":
+         logging.warning(f"ModelResources loading status (cached call): {resources.status}. "
+                         f"Errors: {resources.error_messages}")
+    else:
+        logging.info("All ModelResources loaded successfully (cached call).")
+    return resources
 
+
+#       
 # --- Data Reading / Writing ---
 def read_google_sheet(sheet_url):
     """Reads data from a published Google Sheet URL. Returns a DataFrame."""

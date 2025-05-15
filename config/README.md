@@ -11,15 +11,27 @@
    export CMAKE_ARGS="-DGGML_CUDA=on \
    -DCUDA_PATH=/usr/local/cuda-12.5 \
    -DCUDAToolkit_ROOT=/usr/local/cuda-12.5 \
-   -DCUDAToolkit_INCLUDE_DIR=/usr/local/cuda-12/include \
+   -DCUDAToolkit_INCLUDE_DIR=/usr/local/cuda-12.5/targets/x86_64-linux/include \
    -DCUDAToolkit_LIBRARY_DIR=/usr/local/cuda-12.5/lib64"
    ```
+
+
 
 2. **Point to the NVCC compiler**:
 
    ```bash
    export CUDACXX=/usr/local/cuda-12.5/bin/nvcc
    ```
+
+While CUDACXX and CMAKE_ARGS should be enough for llama-cpp-python's build, it's generally good to have CUDA in your system paths, especially for runtime. Add these to your ~/.bashrc (or ~/.zshrc if you use zsh) and then source it or open a new terminal:
+      
+In ~/.bashrc or ~/.zshrc, add
+
+```bash
+export PATH=/usr/local/cuda-12.5/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda-12.5/lib64:$LD_LIBRARY_PATH
+```
+    
 
 3. **Reinstall llama-cpp-python from source** (force-reinstall to pick up the new build flags):
 
